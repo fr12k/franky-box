@@ -37,6 +37,13 @@ pub const TaskStore = struct {
             agent_id: []const u8,
             since_timestamp: []const u8,
         ) anyerror![]types.OutboxResult,
+        fail: *const fn (
+            ctx: *anyopaque,
+            tenant_id: []const u8,
+            agent_id: []const u8,
+            task_id: []const u8,
+            error_json: []const u8,
+        ) anyerror!bool,
         purge: *const fn (ctx: *anyopaque) anyerror!void,
     };
 
@@ -58,6 +65,10 @@ pub const TaskStore = struct {
 
     pub fn readOutbox(self: TaskStore, allocator: std.mem.Allocator, tenant_id: []const u8, agent_id: []const u8, since_timestamp: []const u8) ![]types.OutboxResult {
         return self.vtable.readOutbox(self.ctx, allocator, tenant_id, agent_id, since_timestamp);
+    }
+
+    pub fn fail(self: TaskStore, tenant_id: []const u8, agent_id: []const u8, task_id: []const u8, error_json: []const u8) !bool {
+        return self.vtable.fail(self.ctx, tenant_id, agent_id, task_id, error_json);
     }
 
     pub fn purge(self: TaskStore) !void {
