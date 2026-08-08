@@ -2,24 +2,24 @@
 
 **Author:** franky-agent  
 **Date:** 2026-08-08  
-**Status:** Draft — v2 (corrected architecture)
+**Status:** Draft — v4 (cleaned, no complementary tools, no memory scoping)
 
 ---
 
 ## 1. Architecture Overview
 
-**franky-box** is a **remote server** (not a library replacement for franky-memory).  
+**franky-box** is a **remote HTTP server** providing a shared task inbox/outbox queue (SQLite-backed).
 **franky** (the agent) registers with `franky-box` at startup and acts as a **worker** — polling tasks from its inbox, executing them, and posting results to the outbox.
 
 ```
                         ┌─────────────────┐
                         │  franky-box      │
                         │  (remote server) │
-                        │                  │
                         │  tasks table     │
-                        │  - inbox (IS NULL)│
-                        │  - outbox (NOT   │
+                        │  - inbox (op IS  │
                         │    NULL)         │
+                        │  - outbox (op IS │
+                        │    NOT NULL)     │
                         └────────┬────────┘
                                  │
               ┌──────────────────┼──────────────────┐
@@ -35,82 +35,40 @@
 
 ---
 
-## 2. Corrected Understanding
+## 2. Key Design Decisions
 
-| Aspect | Previous (wrong v1) | Correct (v2) | Refined (v3 — transparent) |
-|---|---|---|---|
-| franky-box role | Library replacing franky-memory | **Remote server** for task queue | **Remote server** for task queue (unchanged) |
-| franky-memory | No change | **Unchanged** — L1 memory store | **Unchanged** — L1 memory store |
-| Agent starts task | Dispatches to other agents | **Polls** its own inbox for work | **Polls** its own inbox for work |
-| Session per task | Not considered | **Required** — each task_id needs its own | **Required** — each task_id needs its own
-| Polling trigger | Agent decides via tool | **Harness polls when idle** | **Harness polls when idle over SSE** |
-| User visibility | None | None | **Full visibility via proxy web UI** |
-| User intervention | None | None | **Abort, reprompt via web UI** |
-| Event stream | None | None | **SSE /events endpoint active per task** |
+| Decision | Choice | Rationale |
+|---|---|---|
+| Deployment | franky-box = **remote HTTP server** (standalone binary) | Shared queue for many workers; loose coupling |
+| Worker level | **Harness-level** (`--mode worker`) | Session isolation per task, lifecycle, error recovery |
+| Poll when? | **When idle** with exponential backoff (1s → 2s → max 30s) | Unattended autonomous operation |
+| Session per task | **Yes** — fresh session per `task_id` | No context bleeding between unrelated tasks |
+| Loop to reuse | **Proxy mode** loop (SSE + web UI) | User can watch agent work and intervene |
+| User visibility | **Full** via web UI (`http://localhost:8081/`) | Abort stuck tasks, send follow-up prompts |
+| Memory scoping per task | **Not needed** — use `memory_save` as-is | Agent already persists facts globally via existing tool |
+| Complementary tools | **None** in this phase | Only harness-level polling; agent works on the task payload as its prompt |
+| Event stream | **SSE /events** per task, plus heartbeats while idle | Web UI stays connected between tasks |
 
 ---
 
-## 3. Key Design Decisions
+## 3. What franky-box Provides
 
-### 3.1 Harness-Level Worker Mode (Recommended)
-
-A new **`--mode worker`** in franky, not just tool additions. Rationale:
-
-| Aspect | Harness-level (worker mode) | Tool-level only |
-|---|---|---|
-| Autonomy | Agent runs unattended through queue | Agent must think about when to poll |
-| Session isolation | Harness creates fresh session per task | Agent context bleeds between tasks |
-| Error handling | Harness posts fail to outbox on crash | Agent must handle errors itself |
-| Idle behavior | Harness polls with backoff when idle | Agent loops forever asking "what now?" |
-| Complexity | Moderate (new mode) | Low (just tools) but incomplete |
-
-**Decision: Harness-level worker mode with complementary tools.**
-
-### 3.2 When Should the Harness Poll?
-
-**Poll when idle** — not just on demand. The worker mode should:
-
-1. Start up and register with `franky-box` (`POST /v1/agents` if new, then poll)
-2. Enter an **idle loop**:
-   ```
-   while (true) {
-       task = claim(tenant_id, agent_id)
-       if (task) {
-           session = create_session(task.task_id)
-           result = run_agent(session, task.payload)
-           if (result.ok) complete(tenant_id, agent_id, task.task_id, result.output)
-                       else fail(tenant_id, agent_id, task.task_id, result.error)
-       } else {
-           sleep(backoff) // exponential: 1s → 2s → 4s → max 30s
-       }
-   }
-   ```
-
-### 3.3 Session Per Task
-
-**Each `task_id` gets its own session.** This is critical because:
-
-- Agent context (transcript, memory) must not leak between unrelated tasks
-- Sessions are stored under `<FRANKY_HOME>/sessions/<task_id>/`
-- The task payload becomes the **first user prompt** in that session
-- When the agent calls `finish_task`, the harness captures the result and posts to the outbox
-- If the agent gets stuck (max turns exceeded, error), the harness posts a failure to the outbox
-
-### 3.4 Complementary Tools
-
-Even with harness-level polling, agents benefit from awareness tools:
-
-| Tool | Purpose | When called |
-|---|---|---|
-| `task_poll` | **Explicit** poll for next task (bypasses idle polling) | Agent wants to check for priority work |
-| `task_status` | Show current task metadata (task_id, action, try_count) | Agent asks "what am I working on?" |
-| `task_post_result` | Post a result to outbox without calling finish_task | Agent wants to send intermediate results |
+| Capability | Endpoint / API |
+|---|---|
+| Register agent | `POST /v1/agents` → returns `agent_id` + `agent_secret` |
+| Dispatch task | `POST /v1/tasks/dispatch` → inserts into agent's inbox |
+| Claim task (atomic) | `POST /v1/agents/{name}/inbox/claim` → locks with 5min timeout |
+| Complete task | `POST /v1/agents/{name}/outbox/{id}/complete` → moves to outbox |
+| Fail task | `POST /v1/agents/{name}/outbox/{id}/fail` → sets error output |
+| Read outbox | `GET /v1/agents/{name}/outbox` → stream completed tasks |
+| Result via grant | `GET /v1/results/{id}?token=<grant>` → downstream consumers |
+| Passive purge | Included in every claim/dispatch → removes tasks >7 days old |
 
 ---
 
-## 4. Recommended Implementation: `--mode worker`
+## 4. Worker Mode: `--mode worker`
 
-### 4.1 Startup Flow
+### 4.1 Startup
 
 ```
 franky --mode worker \
@@ -118,278 +76,170 @@ franky --mode worker \
   --agent-id billing-agent \
   --agent-secret <secret> \
   --team-id acme-corp \
+  --web-port 8081 \
   --model claude-sonnet-4-6 \
   --max-consecutive-failures 3
 ```
 
-1. Register agent with `franky-box` (or re-use stored credentials)
-2. Enter the worker loop
+1. Authenticate with franky-box using `agent_id` + `agent_secret`
+2. Bind a local HTTP/SSE listener on `127.0.0.1:8081` (identical to `--mode proxy`)
+3. Enter the worker loop
 
-### 4.2 Worker Loop Pseudocode
+### 4.2 Worker Loop
 
-```zig
-pub fn run(allocator, io, config) !void {
-    var store = franky_box.Client.init(allocator, config.server_url);
-    try store.authenticate(config.agent_id, config.agent_secret);
-
-    var consecutive_failures: u32 = 0;
-    var backoff_ms: u64 = 1000;
-
-    while (consecutive_failures < config.max_consecutive_failures) {
-        // Claim next task
-        const task = store.claim(config.team_id, config.agent_id) catch |err| {
-            log.err("claim failed: {}", .{err});
-            consecutive_failures += 1;
-            std.time.sleep(backoff_ms * std.time.ns_per_ms);
-            backoff_ms = @min(backoff_ms * 2, 30_000);
-            continue;
-        };
-        consecutive_failures = 0;
-        backoff_ms = 1000;
-
-        if (task) |t| {
-            defer task.deinit(allocator);
-
-            // Create fresh session for this task
-            var session = try createSession(allocator, io, config, t.task_id, t.payload);
-            defer session.deinit();
-            
-            // Run agent loop (same as print mode, but session-scoped)
-            const result = try runAgentForTask(allocator, io, &session, config);
-
-            // Post result to outbox
-            if (result.ok) {
-                try store.complete(config.team_id, config.agent_id, t.task_id, result.output);
-            } else {
-                try store.fail(config.team_id, config.agent_id, t.task_id, result.error_json);
-            }
-        } else {
-            // No tasks available — sleep with backoff
-            std.time.sleep(backoff_ms * std.time.ns_per_ms);
-            backoff_ms = @min(backoff_ms * 2, 30_000);
-        }
-    }
-
-    log.err("too many consecutive failures, exiting", .{});
-}
+```
+┌────────────────────────────────────────────────────────────────┐
+│  Start proxy listener (port 8081)                              │
+│  Open SSE /events stream                                       │
+│                                                                │
+│  while (true):                                                 │
+│    task = claim(team_id, agent_id)                             │
+│    if task:                                                    │
+│      emit task_started on SSE                                 │
+│      session = create_session(task.task_id)                    │
+│      result = run_agent(session, task.payload, proxy loop)     │
+│      if result.ok → complete(task.task_id, result.output)      │
+│      else         → fail(task.task_id, result.error_json)      │
+│      emit task_completed on SSE                                │
+│    else:                                                       │
+│      sleep(backoff)   # 1s → 2s → 4s → ... → 30s max         │
+│      emit heartbeat on SSE                                     │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.3 Session Creation per Task
+### 4.3 Session Per Task
 
-Each task gets:
-- Session ID = `task_id` (e.g., `task-abc123`)
-- First user message = the task's `payload` (JSON config/instruction)
-- Tools available = standard coding tools + task awareness tools
-- Memory context = loaded from the agent's L1 store, scoped by `task_id`
+Each `task_id` gets its own session (stored under `<FRANKY_HOME>/sessions/<task_id>/`):
 
 ```
 sessions/
 └── task-abc123/
-    ├── session.json    # header: task_id, agent_id, model, started_at
-    └── transcript.json # the agent's conversation for this task
+    ├── session.json     # header: task_id, agent_id, model, started_at
+    └── transcript.json   # agent conversation for this task
 ```
 
-### 4.4 Proxy Mode Integration (Transparency)
+- The task `payload` becomes the **first user prompt** in that session
+- When `finish_task` is called, the harness captures the final transcript state and posts to the outbox
+- When the agent exceeds `max_turns` or errors, the harness posts a failure to the outbox
 
-The worker binds a **local HTTP/SSE listener** identical to proxy mode:
+### 4.4 Memory Scoping
 
-```
-franky --mode worker \
-  --inbox-server https://franky-box.example.com \
-  --agent-id billing-agent \
-  --agent-secret <secret> \
-  --team-id acme-corp \
-  --web-port 8081 \           # local web UI port
-  --model claude-sonnet-4-6
-```
+**Not needed.** The existing `memory_save` / `memory_search` tools already persist facts globally (L1 store). An agent working on a task can recall relevant context from memory regardless of which task created it.
 
-When a task is claimed:
-1. Worker binds a local proxy listener on `127.0.0.1:8081` (or a random available port)
-2. Opens an SSE event stream at `/events` so the web UI shows real-time agent activity
-3. The web UI is available at `http://localhost:8081/` showing:
-   - Current task metadata (task_id, action, try_count)
-   - Live agent thinking and tool calls
-   - Transcript so far
-4. User can **intervene** via:
-   - `POST /abort` — cancel the current task execution (harness posts `fail` to outbox)
-   - `POST /prompt` — send a follow-up message to the agent mid-task
-   - `POST /command` — dispatch slash commands (`/help`, `/clear`, etc.)
-5. When the task completes or fails, the worker:
-   - Posts result to franky-box outbox
-   - Closes the proxy listener
-   - Pauses the web UI with a summary of the completed task
-   - Polls for the next task
+### 4.5 Idle State
 
-```
-  Worker lifecycle:
-  ┌─────────────────────────────────────────────────────┐
-  │  Start proxy listener (port 8081)                   │
-  │  Open SSE /events stream                            │
-  │  Wait for /events client (web UI) or timeout        │
-  │                                                     │
-  │  while (true):                                      │
-  │    task = claim()                                   │
-  │    if task:                                         │
-  │      emit task_started on SSE                       │
-  │      session = create_session(task.task_id)         │
-  │      result = run_agent(session, task, proxy loop)  │
-  │      if result.ok → complete(task, output)          │
-  │      else         → fail(task, error)               │
-  │      emit task_completed on SSE                     │
-  │    else:                                            │
-  │      sleep(backoff)                                 │
-  │      emit heartbeat on SSE                          │
-  └─────────────────────────────────────────────────────┘
-```
+When no tasks are available, the web UI shows:
 
-### 4.5 Idle State: Web UI Shows "Waiting for Tasks"
-
-When the worker has no tasks, the web UI displays a dashboard:
 - Agent identity (`agent-id`, `team-id`)
 - Connection status to franky-box
-- Last claimed task summary
+- Last completed task summary
 - Number of tasks completed this session
 - Current backoff interval
-- A manual "Poll Now" button
+- Manual **Poll Now** button
 
-### 4.6 Heartbeat / Keepalive
+SSE heartbeats every 15 seconds keep the UI connected:
 
-While idle, the SSE stream emits heartbeat events every 15 seconds so the web UI stays connected:
 ```json
 event: heartbeat
 data: {"status":"idle","backoff_ms":4000,"tasks_completed":5}
 ```
 
----
+### 4.6 User Intervention (via Web UI)
 
-## 5. Implementation Steps
+| Action | Endpoint | Effect |
+|---|---|---|
+| Abort | `POST /abort` | Cancels current task; harness posts `fail` to outbox |
+| Send prompt | `POST /prompt` | Sends follow-up message to agent mid-task |
+| Slash commands | `POST /command` | `/help`, `/clear`, `/model`, `/quit` etc. |
 
-### Phase 1: franky-box Client Library (in franky repo)
+### 4.7 Complementary Tools
 
-1. **Create `src/coding/box_client.zig`** — HTTP client wrapping franky-box REST API:
-   - `GET /v1/agents/{name}/inbox/claim` — poll for next task
-   - `POST /v1/agents/{name}/outbox/{task_id}/complete` — post success
-   - `POST /v1/agents/{name}/outbox/{task_id}/fail` — post failure
-   - `GET /v1/agents/{name}/outbox?since=<ts>` — read outbox
-   - Bearer token auth via agent_secret
-
-2. **Box types: `src/coding/box_types.zig`** — Lightweight JSON deserialization for:
-   - `ClaimedTask { task_id, action, payload, try_count }`
-   - No new dependencies — use `std.json` which franky already uses
-
-### Phase 2: Worker Mode (harness-level)
-
-3. **Create `src/coding/modes/worker.zig`** — The worker loop:
-   - CLI flags: `--inbox-server`, `--agent-id`, `--agent-secret`, `--team-id`, `--web-port`, `--max-consecutive-failures`
-   - Reuses `session.create` from existing session infrastructure
-   - **Reuses the proxy mode loop** (not print mode) for SSE streaming + web UI
-   - Binds a local HTTP/SSE listener identical to `--mode proxy`
-   - Idle polling with exponential backoff
-   - SSE heartbeat events while idle
-   - Accepts `/abort`, `/prompt`, `/command` for user intervention
-
-4. **Register `worker` mode** in CLI argument parser and dispatcher
-
-### Phase 3: Task Awareness Tools
-
-5. **Create `src/coding/tools/task_status.zig`** — Agent reads current task metadata
-6. **Create `src/coding/tools/task_post_result.zig`** — Agent posts intermediate results
-
-### Phase 4: Integration & Testing
-
-7. **Integration test**: Start `franky-box` server, start `franky --mode worker`, dispatch tasks, open web UI, verify execution + intervention
-8. **Error handling**: Network failures, auth failures, agent loop crashes, max turn limits, web UI reconnection
-9. **Documentation**: Update README.md, AGENTS.md with worker mode docs
+**None in this phase.** The agent receives the task payload as its initial prompt and works on it with the standard toolset (read, write, edit, bash, ls, find, grep, memory_save, memory_search). No `task_poll`, `task_status`, or `task_post_result` tools — the harness handles all task lifecycle transparently.
 
 ---
 
-## 6. Sequence Diagram
+## 5. Implementation Steps (6 days)
 
-```
-franky-box                    franky worker                  LLM
-    │                             │                          │
-    │   ── claim ───────────────► │                          │
-    │◄── { task_id, payload } ─── │                          │
-    │                             │                          │
-    │                             ├── create session         │
-    │                             │   for task_id             │
-    │                             │                          │
-    │                             ├── send prompt ──────────► │
-    │                             │   (task payload)          │
-    │                             │◄── stream response ────── │
-    │                             │   ...tools, thinking...   │
-    │                             │◄── finish_task ────────── │
-    │                             │                          │
-    │   ── complete(task_id,     │                          │
-    │      result) ─────────────► │                          │
-    │                             │                          │
-    │                             ├── poll next task...      │
-    │                             │                          │
-```
+### Phase 1: franky-box Client Library (1 day)
+
+Create `src/coding/box_client.zig` — HTTP client wrapping franky-box REST API:
+- `POST /v1/agents/{name}/inbox/claim` — poll for next task
+- `POST /v1/agents/{name}/outbox/{task_id}/complete` — post success
+- `POST /v1/agents/{name}/outbox/{task_id}/fail` — post failure
+- Bearer token auth via `agent_secret`
+
+Box types in `src/coding/box_types.zig` — lightweight JSON deserialization using existing `std.json`.
+
+### Phase 2: Worker Mode (3 days)
+
+Create `src/coding/modes/worker.zig`:
+- CLI flags: `--inbox-server`, `--agent-id`, `--agent-secret`, `--team-id`, `--web-port`, `--max-consecutive-failures`
+- Reuses `session.create` from existing session infrastructure
+- **Reuses the proxy mode loop** (not print mode) — SSE event stream + web UI
+- Idle polling with exponential backoff
+- SSE heartbeat events while idle
+- Accepts `/abort`, `/prompt`, `/command` for user intervention
+
+Register `worker` mode in CLI argument parser and dispatcher.
+
+### Phase 3: Integration & Testing (2 days)
+
+- Start franky-box server, start `franky --mode worker`, dispatch tasks, open web UI
+- Verify: task execution, outbox results, web UI streaming, abort intervention, reconnection
+- Error handling: network failures, auth failures, agent loop crashes, max turn limits, consecutive failures exit
+- Documentation: update README.md, AGENTS.md
 
 ---
 
-## 7. franky-box Server Deployment
+## 6. franky-box Server Deployment
 
-For this integration, `franky-box` runs as a standalone HTTP server:
+Franky-box runs as a standalone binary:
 
 ```bash
-# Start the franky-box server on port 8080
-./franky-box 8080 /path/to/tasks.db
+# Start server on port 8080 with persistent DB
+franky-box 8080 /path/to/tasks.db
 ```
 
-Default agent is pre-registered for initial testing. Production deployments add:
-- TLS termination (behind nginx/caddy)
-- Persistent SQLite storage with backups
-- Multiple agent registrations via `POST /v1/agents`
+Production:
+- TLS termination behind nginx/caddy
+- Regular SQLite backups
+- Agent registration via API or pre-seeded credentials
 
 ---
 
-## 8. Open Questions
+## 7. Open Questions
 
-| Question | Consideration | Status |
-|---|---|---|
-| Should worker mode use `print.zig` loop or proxy mode loop? | Proxy adds HTTP/SSe listener overhead but enables transparency. | **Use proxy mode loop** — web UI visibility and user intervention are critical for unattended task execution. |
-| How to handle task-specific memory scoping? | L1 memory should be scoped by `task_id` so each task recalls its own context. | Needs memory store update |
-| What if a task takes hours? | Worker needs keepalive / heartbeat to prevent other workers from claiming the same task (visibility timeout). | Already handled by `locked_until` in franky-box |
-| Should multiple workers share the same agent_id? | No — each worker is a unique `agent_id`. franky-box's claim query ensures one worker gets each task. | Already handled by atomic claim |
-| How does the agent know its task_id for context? | Inject `task_id`, `action`, `try_count` into the system prompt or as an environment variable. | In system prompt |
-| What about task cancellation? | Agent can detect `stop_requested` mid-task. The worker can `POST /v1/agents/{name}/outbox/{task_id}/fail` with a cancellation reason. | Add to v2 |
+| Question | Decision |
+|---|---|
+| Should `--mode worker` support multiple concurrent task sessions? | **No** — one task at a time per worker. Scale horizontally with more workers. |
+| What if franky-box is unreachable? | Exponential backoff; exit after `--max-consecutive-failures` |
+| Task cancellation from franky-box side? | Future phase — v2 could add a `cancelled` state |
+| Where is `--inbox-server` URL stored? | CLI flag or `FRANKY_INBOX_SERVER` env var |
 
 ---
 
-## 9. Risks
+## 8. Risks
 
 | Risk | Mitigation |
 |---|---|
 | Agent context bleeding between tasks | Strict session-per-task; fresh agent state per claim |
-| Worker crashes mid-task | Visibility timeout releases task after 5 min; `try_count` tracks retries; max 3 retries before poison pill |
-| Network failures to franky-box | Exponential backoff, max consecutive failures exit |
-| Long-running tasks monopolize queue | Single-task-per-worker; multiple workers scale horizontally |
-| Memory/session directory bloat | Add cleanup of old task sessions (analogous to 7-day purge in franky-box) |
+| Worker crashes mid-task | Visibility timeout (5 min) releases task; `try_count` tracks retries; max 3 before poison pill |
+| Network failures to franky-box | Exponential backoff; max consecutive failures exit |
+| Long-running tasks block queue | One-task-per-worker; multiple workers scale horizontally |
 
 ---
 
-## 10. Estimated Effort
+## 9. Conclusion
 
-| Phase | Description | Days |
-|---|---|---|
-| 1 | `box_client.zig` + `box_types.zig` (HTTP client) | 1 |
-| 2 | `worker.zig` mode (loop, session-per-task, polling) | 2 |
-| 3 | Task awareness tools (`task_status`, `task_post_result`) | 1 |
-| 4 | Integration testing, error handling, edge cases | 1 |
-| **Total** | | **5 days** |
-
----
-
-## 11. Conclusion
-
-The correct architecture is **franky-box as a remote task queue server**. Franky agents connect as **workers** via a new `--mode worker` that:
+The correct architecture is **franky-box as a remote task queue server**. Franky agents connect as **workers** via `--mode worker` that:
 
 1. **Registers** with franky-box at startup
 2. **Polls** for tasks when idle (exponential backoff when empty)
 3. **Creates a fresh session** per `task_id` (no context mixing)
-4. **Runs the agent** with the task payload as the prompt
+4. **Runs the agent** via the proxy mode loop (SSE stream + web UI)
 5. **Posts results** to the outbox when done or stuck
 
-This is **harness-level** with complementary tools — not just tools. The harness handles lifecycle, session isolation, error recovery, and backoff. **Crucially, the worker reuses the proxy mode loop** — it binds a local HTTP/SSE listener so users can open the web UI, watch the agent work on each task in real time, and intervene with abort/prompt/commands when needed. When idle, the web UI shows a dashboard of agent status, completed tasks, and a manual poll button. Estimated effort: **6 days** (proxy integration adds ~1 day).
+**Memory scoping is handled by the existing `memory_save` tool — no changes needed.**  
+**No complementary task tools in this phase** — the harness handles all lifecycle transparently.
+
+Estimated effort: **6 days**.
