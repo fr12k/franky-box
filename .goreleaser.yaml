@@ -1,6 +1,6 @@
 version: 2
 
-project_name: franky
+project_name: franky-box
 
 builds:
   - builder: zig
