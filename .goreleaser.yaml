@@ -1,0 +1,32 @@
+version: 2
+
+project_name: franky
+
+builds:
+  - builder: zig
+    command: build
+    targets:
+      - x86_64-linux-gnu
+      - aarch64-linux-gnu
+      - x86-linux-gnu
+      - x86_64-macos
+      - aarch64-macos
+    flags:
+      - -Doptimize=ReleaseSafe
+      - -Dversion={{ .Version }}
+      - -Dcommit={{ .ShortCommit }}
+      - -Ddate={{ .CommitDate }}
+archives:
+  - formats: [binary]
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ if eq .Arch \"x86\" }}386{{ else }}{{ .Arch }}{{ end }}"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"

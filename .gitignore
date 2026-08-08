@@ -1,0 +1,10 @@
+.zig-cache/
+zig-out/
+*.o
+*.a
+*.so
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+/tmp/agent-memory-test-*

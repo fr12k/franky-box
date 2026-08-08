@@ -1,0 +1,13 @@
+.{
+    .name = .agent_memory,
+    .version = "0.2.1",
+    .fingerprint = 0xb48a63137efafdc9,
+    .minimum_zig_version = "0.17.0-dev",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "test",
+        "vendor",
+    },
+}
