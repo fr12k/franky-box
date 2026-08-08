@@ -68,6 +68,14 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    // Lightweight module exporting only the box client (no SQLite).
+    // Use this from franky agents to avoid pulling in the whole SQLite build.
+    _ = b.addModule("franky_box_client", .{
+        .root_source_file = b.path("src/box_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Install the sqlite3 static lib as a named artifact so dependents
     // can link it via `dep.artifact("sqlite3")`.
     b.installArtifact(sqlite_lib);
