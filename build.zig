@@ -50,7 +50,7 @@ pub fn build(b: *std.Build) void {
     const sqlite_lib = buildSqliteLib(b, target, optimize);
 
     const lib_mod = b.createModule(.{
-        .root_source_file = b.path("src/sqlite.zig"),
+        .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
