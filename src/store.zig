@@ -1,88 +1,66 @@
-//! Memory store interface — a vtable-based dispatch so callers can use
-//! any concrete implementation behind a uniform API.
-//!
-//! Currently only `SqliteStore` is implemented (embedded mode).
-//! The vtable keeps the door open for a future remote (HTTP) backend.
+//! Task store interface — vtable-based dispatch for franky-box inbox/outbox.
 
 const std = @import("std");
 const types = @import("types.zig");
 
-pub const MemoryStore = struct {
+pub const TaskStore = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
         deinit: *const fn (ctx: *anyopaque) void,
-        capabilities: *const fn (ctx: *anyopaque) types.StoreCapabilities,
-
-        // L1
-        upsert_l1: *const fn (
+        dispatch: *const fn (
             ctx: *anyopaque,
-            record: types.L1Record,
-            embedding: ?[]const f32,
-            iso: types.IsolationContext,
+            tenant_id: []const u8,
+            agent_id: []const u8,
+            task_id: []const u8,
+            action: []const u8,
+            payload: []const u8,
+        ) anyerror!void,
+        claim: *const fn (
+            ctx: *anyopaque,
+            allocator: std.mem.Allocator,
+            tenant_id: []const u8,
+            agent_id: []const u8,
+        ) anyerror!?types.ClaimResult,
+        complete: *const fn (
+            ctx: *anyopaque,
+            tenant_id: []const u8,
+            agent_id: []const u8,
+            task_id: []const u8,
+            output: []const u8,
         ) anyerror!bool,
-
-        search_l1: *const fn (
+        readOutbox: *const fn (
             ctx: *anyopaque,
             allocator: std.mem.Allocator,
-            query: []const u8,
-            top_k: u32,
-            iso: types.IsolationContext,
-        ) anyerror![]types.SearchResult,
-
-        // Recall
-        recall: *const fn (
-            ctx: *anyopaque,
-            allocator: std.mem.Allocator,
-            query: []const u8,
-            top_k: u32,
-            iso: types.IsolationContext,
-        ) anyerror!types.RecallResult,
-
-        recall_with_budget: *const fn (
-            ctx: *anyopaque,
-            allocator: std.mem.Allocator,
-            query: []const u8,
-            top_k: u32,
-            iso: types.IsolationContext,
-            max_chars: usize,
-        ) anyerror!types.RecallResult,
-
-        // Checkpoint
-        get_checkpoint: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!types.Checkpoint,
-        set_checkpoint: *const fn (ctx: *anyopaque, checkpoint: types.Checkpoint) anyerror!void,
+            tenant_id: []const u8,
+            agent_id: []const u8,
+            since_timestamp: []const u8,
+        ) anyerror![]types.OutboxResult,
+        purge: *const fn (ctx: *anyopaque) anyerror!void,
     };
 
-    pub fn deinit(self: MemoryStore) void {
+    pub fn deinit(self: TaskStore) void {
         self.vtable.deinit(self.ctx);
     }
 
-    pub fn capabilities(self: MemoryStore) types.StoreCapabilities {
-        return self.vtable.capabilities(self.ctx);
+    pub fn dispatch(self: TaskStore, tenant_id: []const u8, agent_id: []const u8, task_id: []const u8, action: []const u8, payload: []const u8) !void {
+        return self.vtable.dispatch(self.ctx, tenant_id, agent_id, task_id, action, payload);
     }
 
-    pub fn upsertL1(self: MemoryStore, record: types.L1Record, embedding: ?[]const f32, iso: types.IsolationContext) !bool {
-        return self.vtable.upsert_l1(self.ctx, record, embedding, iso);
+    pub fn claim(self: TaskStore, allocator: std.mem.Allocator, tenant_id: []const u8, agent_id: []const u8) !?types.ClaimResult {
+        return self.vtable.claim(self.ctx, allocator, tenant_id, agent_id);
     }
 
-    pub fn searchL1(self: MemoryStore, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) ![]types.SearchResult {
-        return self.vtable.search_l1(self.ctx, allocator, query, top_k, iso);
+    pub fn complete(self: TaskStore, tenant_id: []const u8, agent_id: []const u8, task_id: []const u8, output: []const u8) !bool {
+        return self.vtable.complete(self.ctx, tenant_id, agent_id, task_id, output);
     }
 
-    pub fn recall(self: MemoryStore, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext) !types.RecallResult {
-        return self.vtable.recall(self.ctx, allocator, query, top_k, iso);
+    pub fn readOutbox(self: TaskStore, allocator: std.mem.Allocator, tenant_id: []const u8, agent_id: []const u8, since_timestamp: []const u8) ![]types.OutboxResult {
+        return self.vtable.readOutbox(self.ctx, allocator, tenant_id, agent_id, since_timestamp);
     }
 
-    pub fn recallWithBudget(self: MemoryStore, allocator: std.mem.Allocator, query: []const u8, top_k: u32, iso: types.IsolationContext, max_chars: usize) !types.RecallResult {
-        return self.vtable.recall_with_budget(self.ctx, allocator, query, top_k, iso, max_chars);
-    }
-
-    pub fn getCheckpoint(self: MemoryStore, allocator: std.mem.Allocator) !types.Checkpoint {
-        return self.vtable.get_checkpoint(self.ctx, allocator);
-    }
-
-    pub fn setCheckpoint(self: MemoryStore, checkpoint: types.Checkpoint) !void {
-        return self.vtable.set_checkpoint(self.ctx, checkpoint);
+    pub fn purge(self: TaskStore) !void {
+        return self.vtable.purge(self.ctx);
     }
 };
