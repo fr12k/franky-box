@@ -121,6 +121,25 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(lib);
 
+    const franky_options = b.addOptions();
+    // Version info — injected by goreleaser via -Dversion / -Dcommit / -Ddate.
+    // Falls back to defaults when building with plain `zig build`.
+    franky_options.addOption(
+        []const u8,
+        "version",
+        b.option([]const u8, "version", "Version string (set by goreleaser)") orelse "dev",
+    );
+    franky_options.addOption(
+        []const u8,
+        "commit",
+        b.option([]const u8, "commit", "Git commit SHA (set by goreleaser)") orelse "unknown",
+    );
+    franky_options.addOption(
+        []const u8,
+        "date",
+        b.option([]const u8, "date", "Build date in RFC3339 (set by goreleaser)") orelse "unknown",
+    );
+
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
