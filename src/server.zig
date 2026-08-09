@@ -107,6 +107,12 @@ pub fn handleWithPath(self: *Server, req: *http.Server.Request, path: []const u8
             return self.handleComplete(req, agent, segments[4], body);
         }
 
+        if (segments.len >= 6 and isSeg(segments[3], "outbox") and isSeg(segments[5], "fail")) {
+            if (method != .POST) return errJson(a, req, .method_not_allowed, "method not allowed");
+            if (!self.requireAgent(agent, req)) return errJson(a, req, .unauthorized, "unauthorized");
+            return self.handleFail(req, agent, segments[4], body);
+        }
+
         return errJson(a, req, .not_found, "route not found");
     }
 
@@ -178,6 +184,17 @@ fn handleComplete(self: *Server, req: *http.Server.Request, agent_id: []const u8
         defer self.allocator.free(resp);
         try json(req, .ok, resp);
     }
+}
+
+fn handleFail(self: *Server, req: *http.Server.Request, agent_id: []const u8, task_id: []const u8, body: []const u8) !void {
+    const ok = self.store.fail("default-team", agent_id, task_id, body) catch |err| {
+        return errJson(self.allocator, req, .internal_server_error, @errorName(err));
+    };
+    if (!ok) return errJson(self.allocator, req, .not_found, "task not found");
+
+    const resp = try fmt.allocPrint(self.allocator, "{{\"task_id\":\"{s}\",\"status\":\"failed\"}}", .{task_id});
+    defer self.allocator.free(resp);
+    try json(req, .ok, resp);
 }
 
 fn handleReadOutbox(self: *Server, req: *http.Server.Request, agent_id: []const u8) !void {
