@@ -93,6 +93,7 @@ pub fn register(self: *BoxClient) ![]const u8 {
     const result = self.client.fetch(.{
         .location = .{ .url = url },
         .method = .POST,
+        .payload = "",
         .response_writer = &body_writer.writer,
         .extra_headers = &self.headers,
     }) catch |err| {
@@ -145,6 +146,7 @@ pub fn claim(self: *BoxClient) !?box_types.ClaimedTask {
     const result = self.client.fetch(.{
         .location = .{ .url = url },
         .method = .POST,
+        .send_body = false,
         .response_writer = &body_writer.writer,
         .extra_headers = &self.headers,
     }) catch |err| {

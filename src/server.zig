@@ -208,9 +208,12 @@ fn handleClaim(self: *Server, req: *http.Server.Request, agent_id: []const u8) !
     };
     if (result) |claimed| {
         defer claimed.deinit(self.allocator);
-        const resp = try fmt.allocPrint(self.allocator, "{{\"task_id\":\"{s}\",\"action\":\"{s}\",\"payload\":{s},\"try_count\":{d}}}", .{ claimed.task_id, claimed.action, claimed.payload, claimed.try_count });
-        defer self.allocator.free(resp);
-        try json(req, .ok, resp);
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        try buf.print(self.allocator, "{{\"task_id\":\"{s}\",\"action\":\"{s}\",\"payload\":", .{claimed.task_id, claimed.action});
+        try jsonPayload(&buf, self.allocator, claimed.payload);
+        try buf.print(self.allocator, ",\"try_count\":{d}}}", .{claimed.try_count});
+        try json(req, .ok, buf.items);
     } else {
         try json(req, .no_content, "{}");
     }
@@ -258,7 +261,11 @@ fn handleReadOutbox(self: *Server, req: *http.Server.Request, agent_id: []const 
     try buf.appendSlice(a, "[");
     for (results, 0..) |r, i| {
         if (i > 0) try buf.appendSlice(a, ",");
-        try buf.print(a, "{{\"task_id\":\"{s}\",\"action\":\"{s}\",\"output\":{s},\"completed_at\":\"{s}\"}}", .{ r.task_id, r.action, r.output, r.completed_at });
+        try buf.print(a, "{{\"task_id\":\"{s}\",\"action\":\"{s}\",\"payload\":", .{r.task_id, r.action});
+        try jsonPayload(&buf, a, r.payload);
+        try buf.appendSlice(a, ",\"output\":");
+        try jsonPayload(&buf, a, r.output);
+        try buf.print(a, ",\"completed_at\":\"{s}\"}}", .{r.completed_at});
     }
     try buf.appendSlice(a, "]");
     try json(req, .ok, buf.items);
