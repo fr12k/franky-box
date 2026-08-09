@@ -85,24 +85,6 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_mod,
     });
 
-    // ── Tests ──────────────────────────────────────────────────────────
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    test_mod.linkLibrary(sqlite_lib);
-
-    const test_bin = b.addTest(.{
-        .name = "franky-box-tests",
-        .root_module = test_mod,
-    });
-
-    const run_tests = b.addRunArtifact(test_bin);
-    const test_step = b.step("test", "Run library tests");
-    test_step.dependOn(&run_tests.step);
-
     // ── Integration tests (separate test binary) ──────────────────────
     const itest_mod = b.createModule(.{
         .root_source_file = b.path("tests/integration_test.zig"),
@@ -122,7 +104,26 @@ pub fn build(b: *std.Build) void {
     const itest_step = b.step("test-integration", "Run integration tests");
     itest_step.dependOn(&run_itests.step);
 
-    // Combined "test-all" step.
+    // ── Unit tests ────────────────────────────────────────────────────
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    test_mod.linkLibrary(sqlite_lib);
+
+    const test_bin = b.addTest(.{
+        .name = "franky-box-tests",
+        .root_module = test_mod,
+    });
+
+    const run_tests = b.addRunArtifact(test_bin);
+    const test_step = b.step("test", "Run all tests (unit + integration)");
+    test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_itests.step);
+
+    // Combined "test-all" step (alias).
     const test_all_step = b.step("test-all", "Run all tests");
     test_all_step.dependOn(&run_tests.step);
     test_all_step.dependOn(&run_itests.step);
