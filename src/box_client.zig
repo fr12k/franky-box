@@ -81,7 +81,7 @@ pub fn claim(self: *BoxClient) !?box_types.ClaimedTask {
 
     if (result.status != .ok) return null;
 
-    const body = body_writer.writer.getWritten();
+    const body = body_writer.writer.buffered();
     return box_types.parseClaimedTask(self.allocator, body) catch null;
 }
 
