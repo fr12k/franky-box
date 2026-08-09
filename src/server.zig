@@ -275,9 +275,23 @@ fn handleGetResult(self: *Server, req: *http.Server.Request, _: []const u8) !voi
 fn isSeg(seg: []const u8, lit: []const u8) bool { return mem.eql(u8, seg, lit); }
 
 fn requireAdmin(req: *http.Server.Request) bool {
-    const auth_hdr = headerValue(req.head_buffer, "authorization") orelse return false;
-    const token = authn.extractBearerToken(auth_hdr) orelse return false;
-    return isAdmin(token);
+    // Check Authorization header first
+    if (headerValue(req.head_buffer, "authorization")) |auth_hdr| {
+        if (authn.extractBearerToken(auth_hdr)) |token| {
+            if (isAdmin(token)) return true;
+        }
+    }
+    // Fall back to fb_admin_token cookie
+    if (headerValue(req.head_buffer, "cookie")) |cookie| {
+        const needle = "fb_admin_token=";
+        const start = mem.indexOf(u8, cookie, needle) orelse return false;
+        const val_start = start + needle.len;
+        var end = val_start;
+        while (end < cookie.len and cookie[end] != ';') : (end += 1) {}
+        const token = cookie[val_start..end];
+        return isAdmin(token);
+    }
+    return false;
 }
 
 fn htmlResp(req: *http.Server.Request, body: []const u8) !void {
@@ -317,17 +331,17 @@ fn handleAdminPage(_: *Server, req: *http.Server.Request) !void {
         \\  </ul>
         \\</nav>
         \\<main class="container">
-        \\  <details role="list" style="margin-bottom:1rem">
-        \\    <summary aria-haspopup="listbox">🔑 Admin Token</summary>
-        \\    <input type="password" id="adminToken" value="admin-token-change-me" style="width:100%%" />
-        \\  </details>
         \\  <hr/>
         \\  <section id="content">
         \\    <p>Select a tab above.</p>
         \\  </section>
         \\</main>
         \\<script>
-        \\function token() { return document.getElementById('adminToken').value; }
+        \\function getCookie(name) {
+        \\  const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+        \\  return match ? match[2] : null;
+        \\}
+        \\function token() { return getCookie('fb_admin_token'); }
         \\function headers() { return { 'Authorization': 'Bearer ' + token(), 'Accept': 'application/json' }; }
         \\async function api(url) {
         \\  const r = await fetch(url, { headers: headers() });
