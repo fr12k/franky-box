@@ -105,7 +105,7 @@ pub fn build(b: *std.Build) void {
 
     // ── Integration tests (separate test binary) ──────────────────────
     const itest_mod = b.createModule(.{
-        .root_source_file = b.path("test/sqlite_store_test.zig"),
+        .root_source_file = b.path("tests/integration_test.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
