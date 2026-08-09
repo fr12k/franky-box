@@ -9,6 +9,11 @@ pub fn main(init: std.process.Init) !void {
     const port: u16 = 8080;
     const db_path = "franky-box.db";
 
+    // Read admin token from environment, if set
+    if (init.environ_map.get("FRANKY_BOX_ADMIN_TOKEN")) |tok| {
+        franky.Server.setAdminToken(tok);
+    }
+
     var store_backend = try franky.SqliteStore.init(allocator, db_path);
     var ts = store_backend.storeInterface();
     defer store_backend.deinit();

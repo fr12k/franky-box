@@ -45,6 +45,16 @@ pub const TaskStore = struct {
             error_json: []const u8,
         ) anyerror!bool,
         purge: *const fn (ctx: *anyopaque) anyerror!void,
+        /// List all pending inbox tasks (admin).
+        fetchInbox: *const fn (
+            ctx: *anyopaque,
+            allocator: std.mem.Allocator,
+        ) anyerror![]types.InboxEntry,
+        /// List all completed outbox tasks across all agents (admin).
+        fetchOutboxAll: *const fn (
+            ctx: *anyopaque,
+            allocator: std.mem.Allocator,
+        ) anyerror![]types.OutboxResult,
     };
 
     pub fn deinit(self: TaskStore) void {
@@ -73,5 +83,13 @@ pub const TaskStore = struct {
 
     pub fn purge(self: TaskStore) !void {
         return self.vtable.purge(self.ctx);
+    }
+
+    pub fn fetchInbox(self: TaskStore, allocator: std.mem.Allocator) ![]types.InboxEntry {
+        return self.vtable.fetchInbox(self.ctx, allocator);
+    }
+
+    pub fn fetchOutboxAll(self: TaskStore, allocator: std.mem.Allocator) ![]types.OutboxResult {
+        return self.vtable.fetchOutboxAll(self.ctx, allocator);
     }
 };

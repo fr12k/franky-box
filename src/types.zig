@@ -53,3 +53,35 @@ pub const OutboxResult = struct {
         allocator.free(self.completed_at);
     }
 };
+
+/// A row from the inbox — pending/unclaimed tasks.
+/// Fields are caller-owned slices allocated via the provided allocator.
+pub const InboxEntry = struct {
+    tenant_id: []const u8,
+    agent_id: []const u8,
+    task_id: []const u8,
+    action: []const u8,
+    payload: []const u8,
+    try_count: i32,
+    locked_until: ?[]const u8,
+
+    pub fn deinit(self: InboxEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.tenant_id);
+        allocator.free(self.agent_id);
+        allocator.free(self.task_id);
+        allocator.free(self.action);
+        allocator.free(self.payload);
+        if (self.locked_until) |lu| allocator.free(lu);
+    }
+};
+
+/// Agent registration info.
+pub const AgentInfo = struct {
+    agent_id: []const u8,
+    secret: []const u8,
+
+    pub fn deinit(self: AgentInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.agent_id);
+        allocator.free(self.secret);
+    }
+};
