@@ -13,6 +13,7 @@ allocator: std.mem.Allocator,
 io: std.Io,
 store: *task_store.TaskStore,
 agents: std.StringHashMap([]const u8),
+next_dispatch_task_id: u64 = 0,
 
 pub const Server = @This();
 
@@ -65,7 +66,10 @@ fn requireAgent(self: *Server, agent_id: []const u8, req: *http.Server.Request) 
 }
 
 pub fn handle(self: *Server, req: *http.Server.Request, body: []const u8) !void {
-    const path = req.head.target;
+    handleWithPath(self, req, req.head.target, body);
+}
+
+pub fn handleWithPath(self: *Server, req: *http.Server.Request, path: []const u8, body: []const u8) !void {
     const method = req.head.method;
     const a = self.allocator;
 
@@ -118,8 +122,10 @@ fn handleRegisterAgent(self: *Server, req: *http.Server.Request, _: []const u8) 
     var buf: [32]u8 = undefined;
     self.io.random(&buf);
     const secret = try fmt.allocPrint(self.allocator, "{s}", .{fmt.bytesToHex(&buf, .lower)});
+    defer self.allocator.free(secret);
 
     const agent_id = try fmt.allocPrint(self.allocator, "agent-{d}", .{self.agents.count()});
+    errdefer self.allocator.free(agent_id);
     try self.agents.put(agent_id, try self.allocator.dupe(u8, secret));
 
     const resp = try fmt.allocPrint(self.allocator, "{{\"agent_id\":\"{s}\",\"agent_secret\":\"{s}\",\"team_id\":\"default\"}}", .{ agent_id, secret });
@@ -128,7 +134,11 @@ fn handleRegisterAgent(self: *Server, req: *http.Server.Request, _: []const u8) 
 }
 
 fn handleDispatch(self: *Server, req: *http.Server.Request, body: []const u8) !void {
-    const task_id = "task-0";
+    // Generate a unique task_id from a monotonic counter.
+    const task_id = try fmt.allocPrint(self.allocator, "task-{d}", .{self.next_dispatch_task_id});
+    defer self.allocator.free(task_id);
+    self.next_dispatch_task_id += 1;
+
     self.store.dispatch("default-team", "agent-0", task_id, "process", body) catch |err| {
         return errJson(self.allocator, req, .internal_server_error, @errorName(err));
     };

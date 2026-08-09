@@ -42,20 +42,40 @@ pub fn main(init: std.process.Init) !void {
             continue;
         };
 
-        const body = if (request.head.content_length) |cl| blk: {
-            if (cl > 0) {
-                const size = @as(usize, @intCast(cl));
-                var body_buf = try allocator.alloc(u8, size);
-                defer allocator.free(body_buf);
-                var body_reader = request.readerExpectNone(body_buf);
-                var body_read_buf: [1][]u8 = .{body_buf};
-                _ = try body_reader.readVec(body_read_buf[0..1]);
-                break :blk body_buf[0..size];
+        const target = try allocator.dupe(u8, request.head.target);
+        defer allocator.free(target);
+
+        const body = blk: {
+            // Properly consume the HTTP body using the server's reader API.
+            // This ensures the HTTP state machine transitions correctly so
+            // that respond() does not hit the discardBody assertion.
+            // For methods without a body (GET, HEAD) we skip this entirely.
+            if (!request.head.method.requestHasBody()) break :blk "";
+
+            var buf: [4096]u8 = undefined;
+            var body_reader = request.readerExpectNone(&buf);
+            // NOTE: after readerExpectNone, head strings are invalidated.
+            // We already saved target above; handlers must not read
+            // request.head.target after this point.
+
+            // For requests with a Content-Length we read the body;
+            // for those without (no body sent), the reader is in
+            // body_none state and we must NOT try to read from it
+            // (it would block forever on a keep-alive connection).
+            if (request.head.content_length) |cl| {
+                if (cl == 0) break :blk "";
+                const body_bytes = body_reader.allocRemaining(allocator, .unlimited) catch |err| {
+                    std.log.warn("read body: {s}", .{@errorName(err)});
+                    request.respond("", .{ .status = .bad_request }) catch {};
+                    continue;
+                };
+                break :blk body_bytes;
             }
             break :blk "";
-        } else "";
+        };
+        defer if (body.len > 0) allocator.free(body);
 
-        api.handle(&request, body) catch |err| {
+        api.handleWithPath(&request, target, body) catch |err| {
             std.log.err("handle: {s}", .{@errorName(err)});
             request.respond("", .{ .status = .internal_server_error }) catch {};
         };
