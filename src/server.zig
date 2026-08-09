@@ -475,7 +475,9 @@ fn handleAdminInboxApi(self: *Server, req: *http.Server.Request) !void {
         if (!first) try buf.appendSlice(a, ",");
         first = false;
         const locked_s = if (t.locked_until) |lu| lu else "null";
-        try buf.print(a, "{{\"task_id\":\"{s}\",\"agent_id\":\"{s}\",\"tenant_id\":\"{s}\",\"action\":\"{s}\",\"payload\":{s},\"try_count\":{d},\"locked_until\":\"{s}\"}}", .{ t.task_id, t.agent_id, t.tenant_id, t.action, t.payload, t.try_count, locked_s });
+        try buf.print(a, "{{\"task_id\":\"{s}\",\"agent_id\":\"{s}\",\"tenant_id\":\"{s}\",\"action\":\"{s}\",\"payload\":", .{t.task_id, t.agent_id, t.tenant_id, t.action});
+        try jsonPayload(&buf, a, t.payload);
+        try buf.print(a, ",\"try_count\":{d},\"locked_until\":\"{s}\"}}", .{ t.try_count, locked_s });
     }
     try buf.appendSlice(a, "]}");
     try json(req, .ok, buf.items);
@@ -493,7 +495,11 @@ fn handleAdminOutboxApi(self: *Server, req: *http.Server.Request) !void {
     for (tasks) |t| {
         if (!first) try buf.appendSlice(a, ",");
         first = false;
-        try buf.print(a, "{{\"task_id\":\"{s}\",\"action\":\"{s}\",\"payload\":{s},\"output\":{s},\"completed_at\":\"{s}\"}}", .{ t.task_id, t.action, t.payload, t.output, t.completed_at });
+        try buf.print(a, "{{\"task_id\":\"{s}\",\"action\":\"{s}\",\"payload\":", .{t.task_id, t.action});
+        try jsonPayload(&buf, a, t.payload);
+        try buf.appendSlice(a, ",\"output\":");
+        try jsonPayload(&buf, a, t.output);
+        try buf.print(a, ",\"completed_at\":\"{s}\"}}", .{t.completed_at});
     }
     try buf.appendSlice(a, "]}");
     try json(req, .ok, buf.items);
@@ -539,6 +545,27 @@ fn handleAdminRegisterAgent(self: *Server, req: *http.Server.Request) !void {
     const resp = try fmt.allocPrint(a, "{{\"agent_id\":\"{s}\",\"agent_secret\":\"{s}\",\"team_id\":\"default\"}}", .{ agent_id, secret });
     defer a.free(resp);
     try json(req, .ok, resp);
+}
+
+/// Emit a payload value as valid JSON: if it looks like a JSON object/array emit raw, otherwise quote+escape.
+fn jsonPayload(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, raw: []const u8) !void {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len > 0 and (trimmed[0] == '{' or trimmed[0] == '[')) {
+        try buf.appendSlice(allocator, raw);
+    } else {
+        try buf.append(allocator, '"');
+        for (raw) |c| {
+            switch (c) {
+                '"' => try buf.appendSlice(allocator, "\\\""),
+                '\\' => try buf.appendSlice(allocator, "\\\\"),
+                '\n' => try buf.appendSlice(allocator, "\\n"),
+                '\r' => try buf.appendSlice(allocator, "\\r"),
+                '\t' => try buf.appendSlice(allocator, "\\t"),
+                else => try buf.append(allocator, c),
+            }
+        }
+        try buf.append(allocator, '"');
+    }
 }
 
 /// Scan for `"<key>":` then extract the value (string, object, or literal).
