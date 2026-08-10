@@ -45,6 +45,7 @@ pub fn deinit(self: *Server) void {
 
 fn json(req: *http.Server.Request, status: http.Status, body: []const u8) !void {
     try req.respond(body, .{ .status = status, .extra_headers = &.{
+        .{ .name = "connection", .value = "close" },
         .{ .name = "content-type", .value = "application/json" },
     } });
 }
@@ -79,7 +80,7 @@ fn requireAgent(self: *Server, agent_id: []const u8, req: *http.Server.Request) 
 }
 
 pub fn handle(self: *Server, req: *http.Server.Request, body: []const u8) !void {
-    handleWithPath(self, req, req.head.target, body);
+    try handleWithPath(self, req, req.head.target, body);
 }
 
 pub fn handleWithPath(self: *Server, req: *http.Server.Request, path: []const u8, body: []const u8) !void {

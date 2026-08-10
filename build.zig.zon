@@ -1,13 +1,13 @@
 .{
-    .name = .agent_memory,
-    .version = "0.2.1",
-    .fingerprint = 0xb48a63137efafdc9,
+    .name = .franky_box,
+    .version = "0.5.0",
+    .fingerprint = 0xd49993744367b2b9,
     .minimum_zig_version = "0.17.0-dev",
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
-        "test",
+        "tests",
         "vendor",
     },
 }
