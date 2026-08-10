@@ -80,8 +80,12 @@ pub fn build(b: *std.Build) void {
     // can link it via `dep.artifact("sqlite3")`.
     b.installArtifact(sqlite_lib);
 
+    // Named "frankybox-lib" (not "franky-box") to avoid ambiguity with
+    // the executable artifact of the same name. Dependents import the
+    // library via the module (b.addModule("franky_box")), not the lib
+    // artifact, so this rename has no downstream impact.
     const lib = b.addLibrary(.{
-        .name = "franky-box",
+        .name = "frankybox-lib",
         .root_module = lib_mod,
     });
 

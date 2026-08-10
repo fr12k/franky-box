@@ -146,7 +146,7 @@ pub fn claim(self: *BoxClient) !?box_types.ClaimedTask {
     const result = self.client.fetch(.{
         .location = .{ .url = url },
         .method = .POST,
-        .send_body = false,
+        .payload = "",  // empty payload avoids sendBodiless (crashes on Zig 0.17-dev)
         .response_writer = &body_writer.writer,
         .extra_headers = &self.headers,
     }) catch |err| {
