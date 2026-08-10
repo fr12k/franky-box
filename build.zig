@@ -46,6 +46,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Register the lightweight client module FIRST, before any SQLite
+    // compilation. This ensures dependents that only need the client
+    // (no SQLite) can import it even if the full build has issues.
+    _ = b.addModule("franky_box_client", .{
+        .root_source_file = b.path("src/box_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // v0.2.0 — compile vendored SQLite amalgamation into a static lib.
     const sqlite_lib = buildSqliteLib(b, target, optimize);
 
@@ -66,14 +75,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-    });
-
-    // Lightweight module exporting only the box client (no SQLite).
-    // Use this from franky agents to avoid pulling in the whole SQLite build.
-    _ = b.addModule("franky_box_client", .{
-        .root_source_file = b.path("src/box_root.zig"),
-        .target = target,
-        .optimize = optimize,
     });
 
     // Install the sqlite3 static lib as a named artifact so dependents
