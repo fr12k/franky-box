@@ -78,13 +78,8 @@ pub fn build(b: *std.Build) void {
     });
 
     // Install the sqlite3 static lib as a named artifact so dependents
-    // can link it via `dep.artifact("sqlite3")`. Guard with build_runner
-    // check: when run as a dependency, installArtifact can conflict with
-    // the parent's own sqlite3 artifact (from agent_memory). Only install
-    // when this is the top-level build.
-    if (b.dep_prefix.len == 0) {
-        b.installArtifact(sqlite_lib);
-    }
+    // can link it via `dep.artifact("sqlite3")`.
+    b.installArtifact(sqlite_lib);
 
     // Named "frankybox-lib" (not "franky-box") to avoid ambiguity with
     // the executable artifact of the same name. Dependents import the
@@ -138,9 +133,7 @@ pub fn build(b: *std.Build) void {
     test_all_step.dependOn(&run_tests.step);
     test_all_step.dependOn(&run_itests.step);
 
-    if (b.dep_prefix.len == 0) {
-        b.installArtifact(lib);
-    }
+    b.installArtifact(lib);
 
     const franky_options = b.addOptions();
     // Version info — injected by goreleaser via -Dversion / -Dcommit / -Ddate.
