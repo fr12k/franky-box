@@ -57,9 +57,8 @@ pub fn build(b: *std.Build) void {
     });
     lib_mod.linkLibrary(sqlite_lib);
 
-    // Export the module under the name "agent_memory" so that dependents
-    // can call `agent_memory_dep.module("agent_memory")` to import it.
-", .{});
+    // Export the module under the name "franky_box" so that dependents
+    // can call `fb_dep.module("franky_box")` to import it.
     // The exported module links sqlite3 from source, so dependents no
     // longer need to linkSystemLibrary("sqlite3") themselves.
     _ = b.addModule("franky_box", .{
@@ -70,7 +69,6 @@ pub fn build(b: *std.Build) void {
     });
 
     // Lightweight module exporting only the box client (no SQLite).
-", .{});
     // Use this from franky agents to avoid pulling in the whole SQLite build.
     _ = b.addModule("franky_box_client", .{
         .root_source_file = b.path("src/box_root.zig"),
