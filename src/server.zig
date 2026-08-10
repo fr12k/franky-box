@@ -45,6 +45,7 @@ pub fn deinit(self: *Server) void {
 
 fn json(req: *http.Server.Request, status: http.Status, body: []const u8) !void {
     try req.respond(body, .{ .status = status, .extra_headers = &.{
+        .{ .name = "connection", .value = "close" },
         .{ .name = "content-type", .value = "application/json" },
     } });
 }
