@@ -9,6 +9,19 @@ const types = @import("types.zig");
 const task_store = @import("store.zig");
 const authn = @import("auth.zig");
 
+/// Admin API token – set via env var `FRANKY_BOX_ADMIN_TOKEN` or default.
+const default_admin_token = "admin-token-change-me";
+var admin_token: []const u8 = default_admin_token;
+
+fn isAdmin(token: []const u8) bool {
+    return mem.eql(u8, token, admin_token);
+}
+
+/// Set the admin API token (call before serving).
+pub fn setAdminToken(token: []const u8) void {
+    admin_token = token;
+}
+
 allocator: std.mem.Allocator,
 io: std.Io,
 store: *task_store.TaskStore,
@@ -121,6 +134,42 @@ pub fn handleWithPath(self: *Server, req: *http.Server.Request, path: []const u8
         return self.handleGetResult(req, segments[2]);
     }
 
+    // --- Admin UI routes ---
+    if (segments.len == 1 and isSeg(segments[0], "admin")) {
+        if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
+        return self.handleAdminPage(req);
+    }
+
+    if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "api")) {
+        if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
+        return self.handleAdminApi(req);
+    }
+
+    if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "agents")) {
+        if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
+        return self.handleAdminAgentsApi(req);
+    }
+
+    if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "inbox")) {
+        if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
+        return self.handleAdminInboxApi(req);
+    }
+
+    if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "outbox")) {
+        if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
+        return self.handleAdminOutboxApi(req);
+    }
+
+    if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "dispatch")) {
+        if (method != .POST) return errJson(a, req, .method_not_allowed, "method not allowed");
+        return self.handleAdminDispatch(req, body);
+    }
+
+    if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "register-agent")) {
+        if (method != .POST) return errJson(a, req, .method_not_allowed, "method not allowed");
+        return self.handleAdminRegisterAgent(req);
+    }
+
     return errJson(a, req, .not_found, "route not found");
 }
 
@@ -159,9 +208,12 @@ fn handleClaim(self: *Server, req: *http.Server.Request, agent_id: []const u8) !
     };
     if (result) |claimed| {
         defer claimed.deinit(self.allocator);
-        const resp = try fmt.allocPrint(self.allocator, "{{\"task_id\":\"{s}\",\"action\":\"{s}\",\"payload\":{s},\"try_count\":{d}}}", .{ claimed.task_id, claimed.action, claimed.payload, claimed.try_count });
-        defer self.allocator.free(resp);
-        try json(req, .ok, resp);
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        try buf.print(self.allocator, "{{\"task_id\":\"{s}\",\"action\":\"{s}\",\"payload\":", .{claimed.task_id, claimed.action});
+        try jsonPayload(&buf, self.allocator, claimed.payload);
+        try buf.print(self.allocator, ",\"try_count\":{d}}}", .{claimed.try_count});
+        try json(req, .ok, buf.items);
     } else {
         try json(req, .no_content, "{}");
     }
@@ -209,7 +261,11 @@ fn handleReadOutbox(self: *Server, req: *http.Server.Request, agent_id: []const 
     try buf.appendSlice(a, "[");
     for (results, 0..) |r, i| {
         if (i > 0) try buf.appendSlice(a, ",");
-        try buf.print(a, "{{\"task_id\":\"{s}\",\"action\":\"{s}\",\"output\":{s},\"completed_at\":\"{s}\"}}", .{ r.task_id, r.action, r.output, r.completed_at });
+        try buf.print(a, "{{\"task_id\":\"{s}\",\"action\":\"{s}\",\"payload\":", .{r.task_id, r.action});
+        try jsonPayload(&buf, a, r.payload);
+        try buf.appendSlice(a, ",\"output\":");
+        try jsonPayload(&buf, a, r.output);
+        try buf.print(a, ",\"completed_at\":\"{s}\"}}", .{r.completed_at});
     }
     try buf.appendSlice(a, "]");
     try json(req, .ok, buf.items);
@@ -224,6 +280,214 @@ fn handleGetResult(self: *Server, req: *http.Server.Request, _: []const u8) !voi
 }
 
 fn isSeg(seg: []const u8, lit: []const u8) bool { return mem.eql(u8, seg, lit); }
+
+fn requireAdmin(req: *http.Server.Request) bool {
+    // Check Authorization header first
+    if (headerValue(req.head_buffer, "authorization")) |auth_hdr| {
+        if (authn.extractBearerToken(auth_hdr)) |token| {
+            if (isAdmin(token)) return true;
+        }
+    }
+    // Fall back to fb_admin_token cookie
+    if (headerValue(req.head_buffer, "cookie")) |cookie| {
+        const needle = "fb_admin_token=";
+        const start = mem.indexOf(u8, cookie, needle) orelse return false;
+        const val_start = start + needle.len;
+        var end = val_start;
+        while (end < cookie.len and cookie[end] != ';') : (end += 1) {}
+        const token = cookie[val_start..end];
+        return isAdmin(token);
+    }
+    return false;
+}
+
+fn htmlResp(req: *http.Server.Request, body: []const u8) !void {
+    try req.respond(body, .{ .extra_headers = &.{
+        .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+    } });
+}
+
+/// Admin UI HTML, embedded from src/web/admin.html at compile time.
+const admin_page_html = @embedFile("web/admin.html");
+
+fn handleAdminPage(_: *Server, req: *http.Server.Request) !void {
+    const page = admin_page_html;
+    try htmlResp(req, page);
+}
+
+fn handleAdminApi(self: *Server, req: *http.Server.Request) !void {
+    if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
+    try json(req, .ok, "{\"status\":\"ok\",\"version\":\"0.3.0\"}");
+}
+
+fn handleAdminAgentsApi(self: *Server, req: *http.Server.Request) !void {
+    if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
+    const a = self.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.appendSlice(a, "{\"agents\":[");
+    var first = true;
+    var it = self.agents.iterator();
+    while (it.next()) |entry| {
+        if (!first) try buf.appendSlice(a, ",");
+        first = false;
+        try buf.print(a, "{{\"agent_id\":\"{s}\",\"secret\":\"{s}\"}}", .{ entry.key_ptr.*, entry.value_ptr.* });
+    }
+    try buf.appendSlice(a, "]}");
+    try json(req, .ok, buf.items);
+}
+
+fn handleAdminInboxApi(self: *Server, req: *http.Server.Request) !void {
+    if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
+    const a = self.allocator;
+    const tasks = self.store.fetchInbox(a) catch |err| return errJson(a, req, .internal_server_error, @errorName(err));
+    defer { for (tasks) |t| t.deinit(a); a.free(tasks); }
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.appendSlice(a, "{\"tasks\":[");
+    var first = true;
+    for (tasks) |t| {
+        if (!first) try buf.appendSlice(a, ",");
+        first = false;
+        const locked_s = if (t.locked_until) |lu| lu else "null";
+        try buf.print(a, "{{\"task_id\":\"{s}\",\"agent_id\":\"{s}\",\"tenant_id\":\"{s}\",\"action\":\"{s}\",\"payload\":", .{t.task_id, t.agent_id, t.tenant_id, t.action});
+        try jsonPayload(&buf, a, t.payload);
+        try buf.print(a, ",\"try_count\":{d},\"locked_until\":\"{s}\"}}", .{ t.try_count, locked_s });
+    }
+    try buf.appendSlice(a, "]}");
+    try json(req, .ok, buf.items);
+}
+
+fn handleAdminOutboxApi(self: *Server, req: *http.Server.Request) !void {
+    if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
+    const a = self.allocator;
+    const tasks = self.store.fetchOutboxAll(a) catch |err| return errJson(a, req, .internal_server_error, @errorName(err));
+    defer { for (tasks) |t| t.deinit(a); a.free(tasks); }
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.appendSlice(a, "{\"tasks\":[");
+    var first = true;
+    for (tasks) |t| {
+        if (!first) try buf.appendSlice(a, ",");
+        first = false;
+        try buf.print(a, "{{\"task_id\":\"{s}\",\"action\":\"{s}\",\"payload\":", .{t.task_id, t.action});
+        try jsonPayload(&buf, a, t.payload);
+        try buf.appendSlice(a, ",\"output\":");
+        try jsonPayload(&buf, a, t.output);
+        try buf.print(a, ",\"completed_at\":\"{s}\"}}", .{t.completed_at});
+    }
+    try buf.appendSlice(a, "]}");
+    try json(req, .ok, buf.items);
+}
+
+fn handleAdminDispatch(self: *Server, req: *http.Server.Request, body: []const u8) !void {
+    if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
+    const a = self.allocator;
+    // Parse JSON body: { "agent_id": "...", "action": "...", "payload": "..." or {...} }
+    // We use a simple approach – extract fields via json scanning.
+    const agent_id = extractJsonField(body, "agent_id", a) orelse return errJson(a, req, .bad_request, "missing agent_id");
+    defer a.free(agent_id);
+    const action = extractJsonField(body, "action", a) orelse return errJson(a, req, .bad_request, "missing action");
+    defer a.free(action);
+    const payload_raw = extractJsonField(body, "payload", a) orelse return errJson(a, req, .bad_request, "missing payload");
+    defer a.free(payload_raw);
+
+    // Check agent exists
+    if (!self.agents.contains(agent_id)) return errJson(a, req, .bad_request, "unknown agent");
+
+    const task_id = try fmt.allocPrint(a, "task-{d}", .{self.next_dispatch_task_id});
+    defer a.free(task_id);
+    self.next_dispatch_task_id += 1;
+
+    self.store.dispatch("default-team", agent_id, task_id, action, payload_raw) catch |err| {
+        return errJson(a, req, .internal_server_error, @errorName(err));
+    };
+    const resp = try fmt.allocPrint(a, "{{\"task_id\":\"{s}\",\"status\":\"dispatched\"}}", .{task_id});
+    defer a.free(resp);
+    try json(req, .ok, resp);
+}
+
+fn handleAdminRegisterAgent(self: *Server, req: *http.Server.Request) !void {
+    if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
+    const a = self.allocator;
+    var buf: [32]u8 = undefined;
+    self.io.random(&buf);
+    const secret = try fmt.allocPrint(a, "{s}", .{fmt.bytesToHex(&buf, .lower)});
+    defer a.free(secret);
+    const agent_id = try fmt.allocPrint(a, "agent-{d}", .{self.agents.count()});
+    errdefer a.free(agent_id);
+    try self.agents.put(agent_id, try a.dupe(u8, secret));
+    const resp = try fmt.allocPrint(a, "{{\"agent_id\":\"{s}\",\"agent_secret\":\"{s}\",\"team_id\":\"default\"}}", .{ agent_id, secret });
+    defer a.free(resp);
+    try json(req, .ok, resp);
+}
+
+/// Emit a payload value as valid JSON: if it looks like a JSON object/array emit raw, otherwise quote+escape.
+fn jsonPayload(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, raw: []const u8) !void {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len > 0 and (trimmed[0] == '{' or trimmed[0] == '[')) {
+        try buf.appendSlice(allocator, raw);
+    } else {
+        try buf.append(allocator, '"');
+        for (raw) |c| {
+            switch (c) {
+                '"' => try buf.appendSlice(allocator, "\\\""),
+                '\\' => try buf.appendSlice(allocator, "\\\\"),
+                '\n' => try buf.appendSlice(allocator, "\\n"),
+                '\r' => try buf.appendSlice(allocator, "\\r"),
+                '\t' => try buf.appendSlice(allocator, "\\t"),
+                else => try buf.append(allocator, c),
+            }
+        }
+        try buf.append(allocator, '"');
+    }
+}
+
+/// Scan for `"<key>":` then extract the value (string, object, or literal).
+fn extractJsonField(body: []const u8, key: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
+    const a = allocator;
+    // find "<key>"  (with optional whitespace after colon)
+    var pos: usize = 0;
+    while (pos < body.len) {
+        // find quote
+        const q = mem.indexOfScalarPos(u8, body, pos, '"') orelse return null;
+        const end_q = mem.indexOfScalarPos(u8, body, q + 1, '"') orelse return null;
+        const k = body[q + 1 .. end_q];
+        if (mem.eql(u8, k, key)) {
+            // found key, skip colon and whitespace
+            var p = end_q + 1;
+            while (p < body.len and (body[p] == ':' or body[p] == ' ' or body[p] == '\t')) : (p += 1) {}
+            if (p >= body.len) return null;
+            const c = body[p];
+            if (c == '"') {
+                // string
+                var i: usize = p + 1;
+                while (i < body.len) : (i += 1) {
+                    if (body[i] == '\\' and i + 1 < body.len) { i += 1; continue; }
+                    if (body[i] == '"') {
+                        return a.dupe(u8, body[p + 1 .. i]) catch null;
+                    }
+                }
+                return null;
+            } else if (c == '{' or c == '[') {
+                var depth: u32 = 1;
+                var i: usize = p + 1;
+                while (i < body.len and depth > 0) : (i += 1) {
+                    if (body[i] == '{' or body[i] == '[') depth += 1;
+                    if (body[i] == '}' or body[i] == ']') depth -= 1;
+                }
+                return a.dupe(u8, body[p..i]) catch null;
+            } else {
+                // number / bool / null
+                var i: usize = p;
+                while (i < body.len and body[i] != ',' and body[i] != '}' and body[i] != ']') : (i += 1) {}
+                return a.dupe(u8, body[p..i]) catch null;
+            }
+        }
+        pos = end_q + 1;
+    }
+    return null;
+}
 
 pub fn registerDefaultAgent(self: *Server) !void {
     try self.agents.put(try self.allocator.dupe(u8, "agent-0"), try self.allocator.dupe(u8, "default-secret-please-change"));

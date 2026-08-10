@@ -151,6 +151,58 @@ pub const SqliteStore = struct {
         );
     }
 
+    /// List all pending inbox tasks across all agents (admin).
+    pub fn fetchInbox(self: *SqliteStore, allocator: std.mem.Allocator) ![]types.InboxEntry {
+        const sql =
+            \\SELECT tenant_id, agent_id, task_id, action, payload, try_count, locked_until
+            \\FROM tasks
+            \\WHERE output IS NULL
+            \\ORDER BY rowid ASC;
+        ;
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+        var results: std.ArrayList(types.InboxEntry) = .empty;
+        defer results.deinit(allocator);
+        while (try stmt.step()) {
+            const locked = stmt.columnText(6);
+            results.append(allocator, .{
+                .tenant_id = try allocator.dupe(u8, stmt.columnText(0)),
+                .agent_id = try allocator.dupe(u8, stmt.columnText(1)),
+                .task_id = try allocator.dupe(u8, stmt.columnText(2)),
+                .action = try allocator.dupe(u8, stmt.columnText(3)),
+                .payload = try allocator.dupe(u8, stmt.columnText(4)),
+                .try_count = @intCast(stmt.columnInt(5)),
+                .locked_until = if (locked.len > 0) try allocator.dupe(u8, locked) else null,
+            }) catch unreachable;
+        }
+        return try results.toOwnedSlice(allocator);
+    }
+
+    /// List all completed outbox tasks across all agents (admin).
+    pub fn fetchOutboxAll(self: *SqliteStore, allocator: std.mem.Allocator) ![]types.OutboxResult {
+        const sql =
+            \\SELECT task_id, action, payload, output, completed_at
+            \\FROM tasks
+            \\WHERE output IS NOT NULL
+            \\ORDER BY completed_at DESC
+            \\LIMIT 500;
+        ;
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+        var results: std.ArrayList(types.OutboxResult) = .empty;
+        defer results.deinit(allocator);
+        while (try stmt.step()) {
+            results.append(allocator, .{
+                .task_id = try allocator.dupe(u8, stmt.columnText(0)),
+                .action = try allocator.dupe(u8, stmt.columnText(1)),
+                .payload = try allocator.dupe(u8, stmt.columnText(2)),
+                .output = try allocator.dupe(u8, stmt.columnText(3)),
+                .completed_at = try allocator.dupe(u8, stmt.columnText(4)),
+            }) catch unreachable;
+        }
+        return try results.toOwnedSlice(allocator);
+    }
+
     pub fn storeInterface(self: *SqliteStore) store.TaskStore {
         return .{ .ctx = self, .vtable = &vtable };
     }
@@ -163,6 +215,8 @@ pub const SqliteStore = struct {
         .readOutbox = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator, t: []const u8, ag: []const u8, s: []const u8) anyerror![]types.OutboxResult { var slf: *SqliteStore = @ptrCast(@alignCast(ctx)); return slf.readOutbox(a, t, ag, s); } }.f,
         .fail = struct { fn f(ctx: *anyopaque, t: []const u8, a: []const u8, i: []const u8, e: []const u8) anyerror!bool { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.fail(t, a, i, e); } }.f,
         .purge = struct { fn f(ctx: *anyopaque) anyerror!void { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.purge(); } }.f,
+        .fetchInbox = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator) anyerror![]types.InboxEntry { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.fetchInbox(a); } }.f,
+        .fetchOutboxAll = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator) anyerror![]types.OutboxResult { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.fetchOutboxAll(a); } }.f,
     };
 };
 
