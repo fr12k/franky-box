@@ -46,6 +46,28 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Version info — injected by goreleaser via -Dversion / -Dcommit / -Ddate.
+    // Falls back to defaults when building with plain `zig build`. Exposed
+    // to source via `@import("build_options")` (see src/root.zig) so the
+    // self-update subcommand and the /status handler report the real
+    // release version instead of a hard-coded constant.
+    const franky_options = b.addOptions();
+    franky_options.addOption(
+        []const u8,
+        "version",
+        b.option([]const u8, "version", "Version string (set by goreleaser)") orelse "dev",
+    );
+    franky_options.addOption(
+        []const u8,
+        "commit",
+        b.option([]const u8, "commit", "Git commit SHA (set by goreleaser)") orelse "unknown",
+    );
+    franky_options.addOption(
+        []const u8,
+        "date",
+        b.option([]const u8, "date", "Build date in RFC3339 (set by goreleaser)") orelse "unknown",
+    );
+
     // Register the lightweight client module FIRST, before any SQLite
     // compilation. This ensures dependents that only need the client
     // (no SQLite) can import it even if the full build has issues.
@@ -65,17 +87,19 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     lib_mod.linkLibrary(sqlite_lib);
+    lib_mod.addOptions("build_options", franky_options);
 
     // Export the module under the name "franky_box" so that dependents
     // can call `fb_dep.module("franky_box")` to import it.
     // The exported module links sqlite3 from source, so dependents no
     // longer need to linkSystemLibrary("sqlite3") themselves.
-    _ = b.addModule("franky_box", .{
+    const franky_box_mod = b.addModule("franky_box", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    franky_box_mod.addOptions("build_options", franky_options);
 
     // Install the sqlite3 static lib as a named artifact so dependents
     // can link it via `dep.artifact("sqlite3")`.
@@ -117,6 +141,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     test_mod.linkLibrary(sqlite_lib);
+    test_mod.addOptions("build_options", franky_options);
 
     const test_bin = b.addTest(.{
         .name = "franky-box-tests",
@@ -135,25 +160,6 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(lib);
 
-    const franky_options = b.addOptions();
-    // Version info — injected by goreleaser via -Dversion / -Dcommit / -Ddate.
-    // Falls back to defaults when building with plain `zig build`.
-    franky_options.addOption(
-        []const u8,
-        "version",
-        b.option([]const u8, "version", "Version string (set by goreleaser)") orelse "dev",
-    );
-    franky_options.addOption(
-        []const u8,
-        "commit",
-        b.option([]const u8, "commit", "Git commit SHA (set by goreleaser)") orelse "unknown",
-    );
-    franky_options.addOption(
-        []const u8,
-        "date",
-        b.option([]const u8, "date", "Build date in RFC3339 (set by goreleaser)") orelse "unknown",
-    );
-
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -161,6 +167,7 @@ pub fn build(b: *std.Build) void {
     });
     exe_module.linkLibrary(sqlite_lib);
     exe_module.addImport("franky_box", lib_mod);
+    exe_module.addOptions("build_options", franky_options);
 
     const exe = b.addExecutable(.{
         .name = "franky-box",

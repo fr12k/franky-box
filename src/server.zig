@@ -8,6 +8,7 @@ const fmt = std.fmt;
 const types = @import("types.zig");
 const task_store = @import("store.zig");
 const authn = @import("auth.zig");
+const build_options = @import("build_options");
 
 /// Admin API token – set via env var `FRANKY_BOX_ADMIN_TOKEN` or default.
 const default_admin_token = "admin-token-change-me";
@@ -318,7 +319,12 @@ fn handleAdminPage(_: *Server, req: *http.Server.Request) !void {
 
 fn handleAdminApi(self: *Server, req: *http.Server.Request) !void {
     if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
-    try json(req, .ok, "{\"status\":\"ok\",\"version\":\"0.3.0\"}");
+    // v0.5.0 — report the real build version (injected by goreleaser via
+    // -Dversion, see build.zig / src/root.zig) instead of a hard-coded
+    // constant, so the admin UI and `franky-box update --check` agree.
+    const body = try std.fmt.allocPrint(self.allocator, "{{\"status\":\"ok\",\"version\":\"{s}\"}}", .{build_options.version});
+    defer self.allocator.free(body);
+    try json(req, .ok, body);
 }
 
 fn handleAdminAgentsApi(self: *Server, req: *http.Server.Request) !void {
