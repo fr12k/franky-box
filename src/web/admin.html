@@ -45,10 +45,17 @@ async function api(url) {
   return r.json();
 }
 function escapeHtml(s) {
-  if (!s) return '';
+  if (s === null || s === undefined) return '';
+  if (typeof s !== 'string') s = String(s);
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 function escapeJson(s) {
+  if (s === null || s === undefined) return '';
+  // The outbox API emits payload/output as raw JSON when they begin with '{' or '[',
+  // so after r.json() they arrive as objects, not strings. Coerce to a string first
+  // so JSON.parse()/escapeHtml() below never receive a non-string (which caused
+  // "s.replace is not a function").
+  if (typeof s === 'object') s = JSON.stringify(s);
   try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return escapeHtml(s); }
 }
 async function loadAgents() {
