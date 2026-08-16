@@ -6,25 +6,195 @@
 <title>Franky-Box Admin</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
 <style>
-  body { padding: 1rem; }
-  pre { overflow-x: auto; max-height: 200px; }
-  h1 { margin-bottom: 0.5rem; }
-  .status-badge { font-size: 0.8rem; padding: 0.2rem 0.5rem; border-radius: 4px; }
+  /* ───── Layout & spacing ───── */
+  body { padding: 0.5rem; }
+  main.container { padding-top: 0.5rem; }
+  hr { margin: 0.5rem 0; }
+  h2 { margin-top: 0; }
+
+  /* ───── Status badges ───── */
+  .status-badge {
+    display: inline-block;
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+  }
   .pending { background: #ffe066; color: #333; }
   .completed { background: #4caf50; color: #fff; }
   .locked { background: #ff9800; color: #fff; }
-  nav { margin-bottom: 1rem; }
+
+  /* ───── Pre blocks ───── */
+  pre {
+    overflow-x: auto;
+    max-height: 200px;
+    white-space: pre;
+    font-size: 0.75rem;
+    margin: 0;
+  }
+
+  /* ───── Toast notifications ───── */
+  .toast {
+    padding: 0.75rem 1rem;
+    border-radius: 6px;
+    margin-bottom: 0.5rem;
+    font-weight: 500;
+  }
+  .toast.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+  .toast.error   { background: #ffe0e0; color: #721c24; border: 1px solid #f5c6cb; }
+
+  /* ───── Loading spinner ───── */
+  .spinner {
+    display: inline-block;
+    width: 1.5rem;
+    height: 1.5rem;
+    border: 3px solid rgba(0,0,0,0.1);
+    border-top-color: #1095c1;
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+    margin: 2rem auto;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ───── Responsive navigation ───── */
+  .navbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.5rem 0;
+    position: relative;
+  }
+  .navbar-brand {
+    font-weight: 700;
+    font-size: 1.1rem;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .navbar-toggle {
+    display: none;
+    background: none;
+    border: 1px solid var(--primary);
+    color: var(--primary);
+    font-size: 1.4rem;
+    line-height: 1;
+    padding: 0.25rem 0.6rem;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .navbar-toggle:focus { outline: 2px solid var(--primary); }
+  .navbar-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+  .navbar-links li a {
+    display: block;
+    padding: 0.35rem 0.75rem;
+    border-radius: 6px;
+    text-decoration: none;
+    font-size: 0.9rem;
+    font-weight: 500;
+    white-space: nowrap;
+    transition: background 0.15s;
+  }
+  .navbar-links li a:hover,
+  .navbar-links li a:focus { background: var(--primary-focus); }
+
+  /* ─── Mobile nav ─── */
+  @media (max-width: 600px) {
+    body { padding: 0.25rem; }
+    .navbar-toggle { display: block; }
+    .navbar-links {
+      display: none;
+      flex-direction: column;
+      width: 100%;
+      margin-top: 0.5rem;
+      gap: 0.15rem;
+    }
+    .navbar-links.open { display: flex; }
+    .navbar-links li a {
+      padding: 0.6rem 0.75rem;
+      font-size: 1rem;
+      border-radius: 6px;
+      background: var(--card-background-color, #f4f4f4);
+    }
+    .navbar-links li a:hover { background: var(--primary-focus); }
+  }
+
+  /* ───── Responsive tables ───── */
+  /* On screens wider than 768px: standard Pico table */
+  @media (min-width: 769px) {
+    .resp-table { width: 100%; }
+  }
+  /* On 768px and below: card layout */
+  @media (max-width: 768px) {
+    .resp-table,
+    .resp-table thead,
+    .resp-table tbody,
+    .resp-table tr,
+    .resp-table th,
+    .resp-table td { display: block; }
+    .resp-table thead { display: none; } /* hide header row */
+    .resp-table tbody tr {
+      background: var(--card-background-color, #fff);
+      border: 1px solid var(--card-border-color, #ddd);
+      border-radius: 8px;
+      padding: 0.75rem;
+      margin-bottom: 0.75rem;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }
+    .resp-table td {
+      padding: 0.3rem 0;
+      border: none;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      gap: 0.25rem;
+    }
+    .resp-table td::before {
+      content: attr(data-label);
+      font-weight: 700;
+      min-width: 5.5rem;
+      flex-shrink: 0;
+      color: var(--muted-color, #666);
+      font-size: 0.8rem;
+    }
+    .resp-table td pre {
+      max-width: 100%;
+      flex: 1;
+      min-width: 0;
+    }
+    .resp-table td code {
+      word-break: break-all;
+    }
+  }
+
+  /* ───── Dispatch form on mobile ───── */
+  @media (max-width: 600px) {
+    #dispatchForm label { display: block; margin-bottom: 0.75rem; }
+    #dispatchForm input,
+    #dispatchForm textarea { width: 100%; box-sizing: border-box; }
+    #dispatchForm button { width: 100%; }
+  }
 </style>
 </head>
 <body>
 <nav class="container-fluid">
-  <ul><li><strong>🔧 Franky-Box Admin</strong></li></ul>
-  <ul>
-    <li><a href="#agents" onclick="loadAgents()">Agents</a></li>
-    <li><a href="#inbox" onclick="loadInbox()">Inbox</a></li>
-    <li><a href="#outbox" onclick="loadOutbox()">Outbox</a></li>
-    <li><a href="#dispatch" onclick="showDispatch()">Send Task</a></li>
-  </ul>
+  <div class="navbar">
+    <div class="navbar-brand">🔧 Franky-Box Admin</div>
+    <button class="navbar-toggle" id="navToggle" aria-label="Toggle navigation menu">☰</button>
+    <ul class="navbar-links" id="navLinks">
+      <li><a href="#agents" onclick="loadAgents(); closeNav();">Agents</a></li>
+      <li><a href="#inbox" onclick="loadInbox(); closeNav();">Inbox</a></li>
+      <li><a href="#outbox" onclick="loadOutbox(); closeNav();">Outbox</a></li>
+      <li><a href="#dispatch" onclick="showDispatch(); closeNav();">Send Task</a></li>
+    </ul>
+  </div>
 </nav>
 <main class="container">
   <hr/>
@@ -33,17 +203,39 @@
   </section>
 </main>
 <script>
+// ─── Cookie / Auth helpers ────────────────────────────────────────
 function getCookie(name) {
   const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
   return match ? match[2] : null;
 }
 function token() { return getCookie('fb_admin_token'); }
 function headers() { return { 'Authorization': 'Bearer ' + token(), 'Accept': 'application/json' }; }
+
+// ─── Nav toggle ──────────────────────────────────────────────────
+function closeNav() {
+  document.getElementById('navLinks').classList.remove('open');
+}
+document.getElementById('navToggle').addEventListener('click', function(e) {
+  e.stopPropagation();
+  document.getElementById('navLinks').classList.toggle('open');
+});
+// Close nav when clicking outside
+document.addEventListener('click', function(e) {
+  const nav = document.getElementById('navLinks');
+  const toggle = document.getElementById('navToggle');
+  if (!nav.contains(e.target) && !toggle.contains(e.target)) {
+    nav.classList.remove('open');
+  }
+});
+
+// ─── API helper ──────────────────────────────────────────────────
 async function api(url) {
   const r = await fetch(url, { headers: headers() });
   if (!r.ok) { const e = await r.json(); throw new Error(e.error || r.statusText); }
   return r.json();
 }
+
+// ─── Helpers ─────────────────────────────────────────────────────
 function escapeHtml(s) {
   if (s === null || s === undefined) return '';
   if (typeof s !== 'string') s = String(s);
@@ -51,52 +243,92 @@ function escapeHtml(s) {
 }
 function escapeJson(s) {
   if (s === null || s === undefined) return '';
-  // The outbox API emits payload/output as raw JSON when they begin with '{' or '[',
-  // so after r.json() they arrive as objects, not strings. Coerce to a string first
-  // so JSON.parse()/escapeHtml() below never receive a non-string (which caused
-  // "s.replace is not a function").
   if (typeof s === 'object') s = JSON.stringify(s);
   try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return escapeHtml(s); }
 }
+function showLoading() {
+  document.getElementById('content').innerHTML = '<div class="spinner"></div>';
+}
+function showToast(type, msg) {
+  return '<div class="toast ' + type + '">' + msg + '</div>';
+}
+
+// ─── Load Agents ─────────────────────────────────────────────────
 async function loadAgents() {
   const el = document.getElementById('content');
+  showLoading();
   try {
     const data = await api('/admin/agents');
-    let html = '<h2 id="agents">🤖 Registered Agents</h2><table><thead><tr><th>Agent ID</th><th>Secret</th></tr></thead><tbody>';
-    data.agents.forEach(a => { html += '<tr><td>' + escapeHtml(a.agent_id) + '</td><td><code>' + escapeHtml(a.secret) + '</code></td></tr>'; });
-    html += '</tbody></table>';
+    let html = '<h2 id="agents">🤖 Registered Agents</h2>';
+    if (!data.agents || data.agents.length === 0) {
+      html += '<p>No agents registered.</p>';
+    } else {
+      html += '<table class="resp-table"><thead><tr><th>Agent ID</th><th>Secret</th></tr></thead><tbody>';
+      data.agents.forEach(a => {
+        html += '<tr><td data-label="Agent ID">' + escapeHtml(a.agent_id) + '</td>'
+              + '<td data-label="Secret"><code>' + escapeHtml(a.secret) + '</code></td></tr>';
+      });
+      html += '</tbody></table>';
+    }
     el.innerHTML = html;
-  } catch(e) { el.innerHTML = '<article style="background:#ffe0e0">❌ ' + escapeHtml(e.message) + '</article>'; }
+  } catch(e) { el.innerHTML = showToast('error', '❌ ' + escapeHtml(e.message)); }
 }
+
+// ─── Load Inbox ──────────────────────────────────────────────────
 async function loadInbox() {
   const el = document.getElementById('content');
+  showLoading();
   try {
     const data = await api('/admin/inbox');
     let html = '<h2 id="inbox">📥 Inbox (Pending Tasks)</h2>';
-    if (data.tasks.length === 0) { html += '<p>No pending tasks.</p>'; el.innerHTML = html; return; }
-    html += '<table><thead><tr><th>Task ID</th><th>Agent</th><th>Action</th><th>Payload</th><th>Try</th><th>Locked Until</th></tr></thead><tbody>';
-    data.tasks.forEach(t => {
-      const lockClass = t.locked_until ? 'locked' : 'pending';
-      html += '<tr><td><code>' + escapeHtml(t.task_id) + '</code></td><td>' + escapeHtml(t.agent_id) + '</td><td>' + escapeHtml(t.action) + '</td><td><pre>' + escapeJson(t.payload) + '</pre></td><td><span class="status-badge ' + lockClass + '">' + t.try_count + '</span></td><td>' + (t.locked_until ? escapeHtml(t.locked_until) : '-') + '</td></tr>';
-    });
-    html += '</tbody></table>';
+    if (!data.tasks || data.tasks.length === 0) {
+      html += '<p>No pending tasks.</p>';
+    } else {
+      html += '<table class="resp-table"><thead><tr><th>Task ID</th><th>Agent</th><th>Action</th><th>Payload</th><th>Try</th><th>Locked Until</th></tr></thead><tbody>';
+      data.tasks.forEach(t => {
+        const lockClass = t.locked_until ? 'locked' : 'pending';
+        html += '<tr>'
+          + '<td data-label="Task ID"><code>' + escapeHtml(t.task_id) + '</code></td>'
+          + '<td data-label="Agent">' + escapeHtml(t.agent_id) + '</td>'
+          + '<td data-label="Action">' + escapeHtml(t.action) + '</td>'
+          + '<td data-label="Payload"><pre>' + escapeJson(t.payload) + '</pre></td>'
+          + '<td data-label="Try"><span class="status-badge ' + lockClass + '">' + t.try_count + '</span></td>'
+          + '<td data-label="Locked Until">' + (t.locked_until ? escapeHtml(t.locked_until) : '-') + '</td>'
+          + '</tr>';
+      });
+      html += '</tbody></table>';
+    }
     el.innerHTML = html;
-  } catch(e) { el.innerHTML = '<article style="background:#ffe0e0">❌ ' + escapeHtml(e.message) + '</article>'; }
+  } catch(e) { el.innerHTML = showToast('error', '❌ ' + escapeHtml(e.message)); }
 }
+
+// ─── Load Outbox ─────────────────────────────────────────────────
 async function loadOutbox() {
   const el = document.getElementById('content');
+  showLoading();
   try {
     const data = await api('/admin/outbox');
     let html = '<h2 id="outbox">📤 Outbox (Completed Tasks)</h2>';
-    if (data.tasks.length === 0) { html += '<p>No completed tasks.</p>'; el.innerHTML = html; return; }
-    html += '<table><thead><tr><th>Task ID</th><th>Action</th><th>Payload</th><th>Output</th><th>Completed At</th></tr></thead><tbody>';
-    data.tasks.forEach(t => {
-      html += '<tr><td><code>' + escapeHtml(t.task_id) + '</code></td><td>' + escapeHtml(t.action) + '</td><td><pre>' + escapeJson(t.payload) + '</pre></td><td><pre>' + escapeJson(t.output) + '</pre></td><td>' + escapeHtml(t.completed_at) + '</td></tr>';
-    });
-    html += '</tbody></table>';
+    if (!data.tasks || data.tasks.length === 0) {
+      html += '<p>No completed tasks.</p>';
+    } else {
+      html += '<table class="resp-table"><thead><tr><th>Task ID</th><th>Action</th><th>Payload</th><th>Output</th><th>Completed At</th></tr></thead><tbody>';
+      data.tasks.forEach(t => {
+        html += '<tr>'
+          + '<td data-label="Task ID"><code>' + escapeHtml(t.task_id) + '</code></td>'
+          + '<td data-label="Action">' + escapeHtml(t.action) + '</td>'
+          + '<td data-label="Payload"><pre>' + escapeJson(t.payload) + '</pre></td>'
+          + '<td data-label="Output"><pre>' + escapeJson(t.output) + '</pre></td>'
+          + '<td data-label="Completed At">' + escapeHtml(t.completed_at) + '</td>'
+          + '</tr>';
+      });
+      html += '</tbody></table>';
+    }
     el.innerHTML = html;
-  } catch(e) { el.innerHTML = '<article style="background:#ffe0e0">❌ ' + escapeHtml(e.message) + '</article>'; }
+  } catch(e) { el.innerHTML = showToast('error', '❌ ' + escapeHtml(e.message)); }
 }
+
+// ─── Dispatch ────────────────────────────────────────────────────
 function showDispatch() {
   const el = document.getElementById('content');
   el.innerHTML = `
@@ -122,6 +354,7 @@ async function doDispatch(event) {
   const agent = document.getElementById('dispatchAgent').value;
   const action = document.getElementById('dispatchAction').value;
   const payload = document.getElementById('dispatchPayload').value;
+  el.innerHTML = '<div class="spinner"></div>';
   try {
     const r = await fetch('/admin/dispatch', {
       method: 'POST',
@@ -130,10 +363,12 @@ async function doDispatch(event) {
     });
     const data = await r.json();
     if (!r.ok) throw new Error(data.error || r.statusText);
-    el.innerHTML = '<article style="background:#d4edda">✅ Task dispatched: <code>' + escapeHtml(data.task_id) + '</code></article>';
-  } catch(e) { el.innerHTML = '<article style="background:#ffe0e0">❌ ' + escapeHtml(e.message) + '</article>'; }
+    el.innerHTML = showToast('success', '✅ Task dispatched: <code>' + escapeHtml(data.task_id) + '</code>');
+  } catch(e) { el.innerHTML = showToast('error', '❌ ' + escapeHtml(e.message)); }
   return false;
 }
+
+// ─── Auto-load on start ─────────────────────────────────────────
 async function loadAgentsOnStart() { try { await loadAgents(); } catch { /* ignore */ } }
 loadAgentsOnStart();
 </script>
