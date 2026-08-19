@@ -284,11 +284,12 @@ async function loadInbox() {
     if (!data.tasks || data.tasks.length === 0) {
       html += '<p>No pending tasks.</p>';
     } else {
-      html += '<table class="resp-table"><thead><tr><th>Task ID</th><th>Agent</th><th>Action</th><th>Payload</th><th>Try</th><th>Locked Until</th></tr></thead><tbody>';
+      html += '<table class="resp-table"><thead><tr><th>Task ID</th><th>Workstream</th><th>Agent</th><th>Action</th><th>Payload</th><th>Try</th><th>Locked Until</th></tr></thead><tbody>';
       data.tasks.forEach(t => {
         const lockClass = t.locked_until ? 'locked' : 'pending';
         html += '<tr>'
           + '<td data-label="Task ID"><code>' + escapeHtml(t.task_id) + '</code></td>'
+          + '<td data-label="Workstream"><code>' + escapeHtml(t.workstream_id || '-') + '</code></td>'
           + '<td data-label="Agent">' + escapeHtml(t.agent_id) + '</td>'
           + '<td data-label="Action">' + escapeHtml(t.action) + '</td>'
           + '<td data-label="Payload"><pre>' + escapeJson(t.payload) + '</pre></td>'
@@ -312,10 +313,11 @@ async function loadOutbox() {
     if (!data.tasks || data.tasks.length === 0) {
       html += '<p>No completed tasks.</p>';
     } else {
-      html += '<table class="resp-table"><thead><tr><th>Task ID</th><th>Action</th><th>Payload</th><th>Output</th><th>Completed At</th></tr></thead><tbody>';
+      html += '<table class="resp-table"><thead><tr><th>Task ID</th><th>Workstream</th><th>Action</th><th>Payload</th><th>Output</th><th>Completed At</th></tr></thead><tbody>';
       data.tasks.forEach(t => {
         html += '<tr>'
           + '<td data-label="Task ID"><code>' + escapeHtml(t.task_id) + '</code></td>'
+          + '<td data-label="Workstream"><code>' + escapeHtml(t.workstream_id || '-') + '</code></td>'
           + '<td data-label="Action">' + escapeHtml(t.action) + '</td>'
           + '<td data-label="Payload"><pre>' + escapeJson(t.payload) + '</pre></td>'
           + '<td data-label="Output"><pre>' + escapeJson(t.output) + '</pre></td>'
@@ -343,6 +345,9 @@ function showDispatch() {
       <label>Payload (JSON)
         <textarea id="dispatchPayload" rows="4" required>{"key": "value"}</textarea>
       </label>
+      <label>Workstream ID (optional — leave empty to start a new workstream)
+        <input type="text" id="dispatchWorkstream" placeholder="existing workstream id to continue a chain" />
+      </label>
       <button type="submit">🚀 Dispatch</button>
     </form>
     <div id="dispatchResult"></div>
@@ -354,12 +359,15 @@ async function doDispatch(event) {
   const agent = document.getElementById('dispatchAgent').value;
   const action = document.getElementById('dispatchAction').value;
   const payload = document.getElementById('dispatchPayload').value;
+  const workstream = document.getElementById('dispatchWorkstream').value.trim();
   el.innerHTML = '<div class="spinner"></div>';
   try {
+    const body = { agent_id: agent, action: action, payload: payload };
+    if (workstream) body.workstream_id = workstream;
     const r = await fetch('/admin/dispatch', {
       method: 'POST',
       headers: Object.assign(headers(), { 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ agent_id: agent, action: action, payload: payload })
+      body: JSON.stringify(body)
     });
     const data = await r.json();
     if (!r.ok) throw new Error(data.error || r.statusText);

@@ -33,15 +33,50 @@ pub const SqliteStore = struct {
             \\  output TEXT DEFAULT NULL,
             \\  try_count INTEGER DEFAULT 0,
             \\  locked_until TEXT DEFAULT NULL,
-            \\  completed_at TEXT DEFAULT NULL
+            \\  completed_at TEXT DEFAULT NULL,
+            \\  workstream_id TEXT DEFAULT NULL
             \\);
         );
+        // Migrate pre-existing databases: add the workstream column if absent.
+        // SQLite has no ADD COLUMN IF NOT EXISTS, so probe pragma_table_info.
+        addColumnIfMissing(db, "tasks", "workstream_id", "TEXT DEFAULT NULL") catch {};
         try db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_routing ON tasks (tenant_id, agent_id, output, locked_until)");
+        try db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_workstream ON tasks (workstream_id)");
     }
 
-    pub fn dispatch(self: *SqliteStore, tenant_id: []const u8, agent_id: []const u8, task_id: []const u8, action: []const u8, payload: []const u8) !void {
+    /// Add a column to a table only if it does not already exist.
+    fn addColumnIfMissing(db: *sqlite.Db, table: []const u8, column: []const u8, decl: []const u8) !void {
+        var buf: [256]u8 = undefined;
+        const sql = try std.fmt.bufPrint(&buf, "SELECT COUNT(*) FROM pragma_table_info('{s}') WHERE name='{s}'", .{ table, column });
+        var stmt = try db.prepare(sql);
+        defer stmt.finalize();
+        if (try stmt.step()) {
+            if (stmt.columnInt(0) > 0) return; // column already present
+        }
+        var buf2: [256]u8 = undefined;
+        const alter = try std.fmt.bufPrint(&buf2, "ALTER TABLE {s} ADD COLUMN {s} {s}", .{ table, column, decl });
+        try db.exec(alter);
+    }
+
+    /// Dispatch a new task.
+    ///
+    /// `workstream_id` controls workstream linking:
+    ///   - when non-null, this task joins that existing workstream (follow-up /
+    ///     continuation of another task in the same chain);
+    ///   - when null, the task seeds a new workstream with its own `task_id`.
+    ///
+    /// Querying `WHERE workstream_id = ?` then returns the whole chain.
+    pub fn dispatch(self: *SqliteStore, tenant_id: []const u8, agent_id: []const u8, task_id: []const u8, action: []const u8, payload: []const u8, workstream_id: ?[]const u8) !void {
         try self.purge();
-        const sql = "INSERT INTO tasks (tenant_id, agent_id, task_id, action, payload) VALUES (?, ?, ?, ?, ?)";
+
+        // Resolve the effective workstream id: use the given one, else seed
+        // a new workstream with this task's own id.
+        const ws: []const u8 = workstream_id orelse task_id;
+
+        const sql =
+            \\INSERT INTO tasks (tenant_id, agent_id, task_id, action, payload, workstream_id)
+            \\VALUES (?, ?, ?, ?, ?, ?)
+        ;
         var stmt = try self.db.prepare(sql);
         defer stmt.finalize();
         try stmt.bindText(1, tenant_id);
@@ -49,6 +84,7 @@ pub const SqliteStore = struct {
         try stmt.bindText(3, task_id);
         try stmt.bindText(4, action);
         try stmt.bindText(5, payload);
+        try stmt.bindText(6, ws);
         _ = try stmt.step();
     }
 
@@ -70,18 +106,20 @@ pub const SqliteStore = struct {
             \\   ORDER BY rowid ASC
             \\   LIMIT 1
             \\)
-            \\RETURNING task_id, action, payload, try_count;
+            \\RETURNING task_id, action, payload, try_count, workstream_id;
         ;
         var stmt = try self.db.prepare(sql);
         defer stmt.finalize();
         try stmt.bindText(1, tenant_id);
         try stmt.bindText(2, agent_id);
         if (try stmt.step()) {
+            const ws = stmt.columnText(4);
             return types.ClaimResult{
                 .task_id = try allocator.dupe(u8, stmt.columnText(0)),
                 .action = try allocator.dupe(u8, stmt.columnText(1)),
                 .payload = try allocator.dupe(u8, stmt.columnText(2)),
                 .try_count = @intCast(stmt.columnInt(3)),
+                .workstream_id = if (ws.len > 0) try allocator.dupe(u8, ws) else null,
             };
         }
         return null;
@@ -121,7 +159,7 @@ pub const SqliteStore = struct {
 
     pub fn readOutbox(self: *SqliteStore, allocator: std.mem.Allocator, tenant_id: []const u8, agent_id: []const u8, since_timestamp: []const u8) ![]types.OutboxResult {
         const sql =
-            \\SELECT task_id, action, payload, output, completed_at
+            \\SELECT task_id, action, payload, output, completed_at, workstream_id
             \\FROM tasks
             \\WHERE tenant_id = ? AND agent_id = ? AND output IS NOT NULL AND datetime(completed_at) > datetime(?)
             \\ORDER BY completed_at ASC;
@@ -134,12 +172,14 @@ pub const SqliteStore = struct {
         var results: std.ArrayList(types.OutboxResult) = .empty;
         defer results.deinit(allocator);
         while (try stmt.step()) {
+            const ws = stmt.columnText(5);
             try results.append(allocator, .{
                 .task_id = try allocator.dupe(u8, stmt.columnText(0)),
                 .action = try allocator.dupe(u8, stmt.columnText(1)),
                 .payload = try allocator.dupe(u8, stmt.columnText(2)),
                 .output = try allocator.dupe(u8, stmt.columnText(3)),
                 .completed_at = try allocator.dupe(u8, stmt.columnText(4)),
+                .workstream_id = if (ws.len > 0) try allocator.dupe(u8, ws) else null,
             });
         }
         return try results.toOwnedSlice(allocator);
@@ -154,7 +194,7 @@ pub const SqliteStore = struct {
     /// List all pending inbox tasks across all agents (admin).
     pub fn fetchInbox(self: *SqliteStore, allocator: std.mem.Allocator) ![]types.InboxEntry {
         const sql =
-            \\SELECT tenant_id, agent_id, task_id, action, payload, try_count, locked_until
+            \\SELECT tenant_id, agent_id, task_id, action, payload, try_count, locked_until, workstream_id
             \\FROM tasks
             \\WHERE output IS NULL
             \\ORDER BY rowid ASC;
@@ -165,6 +205,7 @@ pub const SqliteStore = struct {
         defer results.deinit(allocator);
         while (try stmt.step()) {
             const locked = stmt.columnText(6);
+            const ws = stmt.columnText(7);
             results.append(allocator, .{
                 .tenant_id = try allocator.dupe(u8, stmt.columnText(0)),
                 .agent_id = try allocator.dupe(u8, stmt.columnText(1)),
@@ -173,6 +214,7 @@ pub const SqliteStore = struct {
                 .payload = try allocator.dupe(u8, stmt.columnText(4)),
                 .try_count = @intCast(stmt.columnInt(5)),
                 .locked_until = if (locked.len > 0) try allocator.dupe(u8, locked) else null,
+                .workstream_id = if (ws.len > 0) try allocator.dupe(u8, ws) else null,
             }) catch unreachable;
         }
         return try results.toOwnedSlice(allocator);
@@ -181,7 +223,7 @@ pub const SqliteStore = struct {
     /// List all completed outbox tasks across all agents (admin).
     pub fn fetchOutboxAll(self: *SqliteStore, allocator: std.mem.Allocator) ![]types.OutboxResult {
         const sql =
-            \\SELECT task_id, action, payload, output, completed_at
+            \\SELECT task_id, action, payload, output, completed_at, workstream_id
             \\FROM tasks
             \\WHERE output IS NOT NULL
             \\ORDER BY completed_at DESC
@@ -192,12 +234,14 @@ pub const SqliteStore = struct {
         var results: std.ArrayList(types.OutboxResult) = .empty;
         defer results.deinit(allocator);
         while (try stmt.step()) {
+            const ws = stmt.columnText(5);
             results.append(allocator, .{
                 .task_id = try allocator.dupe(u8, stmt.columnText(0)),
                 .action = try allocator.dupe(u8, stmt.columnText(1)),
                 .payload = try allocator.dupe(u8, stmt.columnText(2)),
                 .output = try allocator.dupe(u8, stmt.columnText(3)),
                 .completed_at = try allocator.dupe(u8, stmt.columnText(4)),
+                .workstream_id = if (ws.len > 0) try allocator.dupe(u8, ws) else null,
             }) catch unreachable;
         }
         return try results.toOwnedSlice(allocator);
@@ -209,7 +253,7 @@ pub const SqliteStore = struct {
 
     const vtable = store.TaskStore.VTable{
         .deinit = struct { fn f(ctx: *anyopaque) void { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); s.deinit(); } }.f,
-        .dispatch = struct { fn f(ctx: *anyopaque, t: []const u8, a: []const u8, i: []const u8, c: []const u8, p: []const u8) anyerror!void { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.dispatch(t, a, i, c, p); } }.f,
+        .dispatch = struct { fn f(ctx: *anyopaque, t: []const u8, a: []const u8, i: []const u8, c: []const u8, p: []const u8, ws: ?[]const u8) anyerror!void { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.dispatch(t, a, i, c, p, ws); } }.f,
         .claim = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator, t: []const u8, ag: []const u8) anyerror!?types.ClaimResult { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.claim(a, t, ag); } }.f,
         .complete = struct { fn f(ctx: *anyopaque, t: []const u8, a: []const u8, i: []const u8, o: []const u8) anyerror!bool { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.complete(t, a, i, o); } }.f,
         .readOutbox = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator, t: []const u8, ag: []const u8, s: []const u8) anyerror![]types.OutboxResult { var slf: *SqliteStore = @ptrCast(@alignCast(ctx)); return slf.readOutbox(a, t, ag, s); } }.f,
@@ -227,7 +271,7 @@ test "sqlite store inbox outbox workflow" {
     defer sql_store.deinit();
     const ts = sql_store.storeInterface();
 
-    try ts.dispatch("team-1", "billing-agent", "task-101", "generate_invoice", "{\"amount\": 100}");
+    try ts.dispatch("team-1", "billing-agent", "task-101", "generate_invoice", "{\"amount\": 100}", null);
 
     const claim_opt = try ts.claim(allocator, "team-1", "billing-agent");
     try std.testing.expect(claim_opt != null);
@@ -254,7 +298,7 @@ test "sqlite store fail workflow" {
     defer sql_store.deinit();
     const ts = sql_store.storeInterface();
 
-    try ts.dispatch("team-1", "billing-agent", "task-201", "process", "{}");
+    try ts.dispatch("team-1", "billing-agent", "task-201", "process", "{}", null);
     const claim_opt = try ts.claim(allocator, "team-1", "billing-agent");
     try std.testing.expect(claim_opt != null);
     const claim = claim_opt.?;
@@ -268,4 +312,55 @@ test "sqlite store fail workflow" {
     try std.testing.expectEqual(1, outbox.len);
     try std.testing.expectEqualStrings("task-201", outbox[0].task_id);
     try std.testing.expectEqualStrings("{\"error\": \"processing failed\"}", outbox[0].output);
+}
+
+test "sqlite store workstream linking" {
+    const allocator = std.testing.allocator;
+    const db_path = ":memory:";
+    var sql_store = try SqliteStore.init(allocator, db_path);
+    defer sql_store.deinit();
+    const ts = sql_store.storeInterface();
+
+    // Root task: no workstream given → seeds its own workstream with its task_id.
+    try ts.dispatch("team-1", "billing-agent", "root-1", "generate", "{}", null);
+    // Follow-up: explicit workstream_id links it to the root's workstream.
+    try ts.dispatch("team-1", "billing-agent", "follow-1", "review", "{}", "root-1");
+    // Another follow-up in the same workstream.
+    try ts.dispatch("team-1", "billing-agent", "follow-2", "publish", "{}", "root-1");
+    // An unrelated root task seeds its own workstream.
+    try ts.dispatch("team-1", "billing-agent", "root-2", "generate", "{}", null);
+
+    // Claim the root-1 task and verify its workstream_id is itself.
+    const claim1 = try ts.claim(allocator, "team-1", "billing-agent");
+    try std.testing.expect(claim1 != null);
+    if (claim1) |c| {
+        defer c.deinit(allocator);
+        try std.testing.expectEqualStrings("root-1", c.task_id);
+        try std.testing.expect(c.workstream_id != null);
+        if (c.workstream_id) |w| try std.testing.expectEqualStrings("root-1", w);
+    }
+
+    // Inbox listing shows workstream ids. All 4 dispatched tasks are still
+    // pending (claiming root-1 only locks it; it remains in the inbox).
+    const inbox = try ts.fetchInbox(allocator);
+    defer { for (inbox) |t| t.deinit(allocator); allocator.free(inbox); }
+    try std.testing.expectEqual(@as(usize, 4), inbox.len);
+    // Each pending task carries a non-null workstream_id.
+    for (inbox) |t| try std.testing.expect(t.workstream_id != null);
+    // root-1 seeds its own workstream; follow-1/follow-2 share root-1's workstream;
+    // root-2 has its own workstream.
+    for (inbox) |t| {
+        if (std.mem.eql(u8, t.task_id, "root-1")) {
+            if (t.workstream_id) |w| try std.testing.expectEqualStrings("root-1", w);
+        }
+        if (std.mem.eql(u8, t.task_id, "follow-1")) {
+            if (t.workstream_id) |w| try std.testing.expectEqualStrings("root-1", w);
+        }
+        if (std.mem.eql(u8, t.task_id, "follow-2")) {
+            if (t.workstream_id) |w| try std.testing.expectEqualStrings("root-1", w);
+        }
+        if (std.mem.eql(u8, t.task_id, "root-2")) {
+            if (t.workstream_id) |w| try std.testing.expectEqualStrings("root-2", w);
+        }
+    }
 }

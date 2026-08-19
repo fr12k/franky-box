@@ -199,9 +199,14 @@ test "dispatch multiple tasks — each gets a unique task_id" {
     defer r2.deinit(testing.allocator);
     try testing.expectEqual(@as(u16, 200), r2.status_code);
 
-    // Task IDs should be different
-    try testing.expect(std.mem.indexOf(u8, r1.body, "task-0") != null);
-    try testing.expect(std.mem.indexOf(u8, r2.body, "task-1") != null);
+    // Each response carries a task_id (UUID) and the two differ.
+    const id1 = extractTaskId(r1.body) orelse return error.MissingTaskId1;
+    defer testing.allocator.free(id1);
+    const id2 = extractTaskId(r2.body) orelse return error.MissingTaskId2;
+    defer testing.allocator.free(id2);
+    try testing.expect(id1.len > 0);
+    try testing.expect(id2.len > 0);
+    try testing.expect(!std.mem.eql(u8, id1, id2));
 }
 
 test "dispatch with plain text body (no Content-Type)" {
@@ -233,13 +238,18 @@ test "claim and complete a task — full workflow" {
     );
     defer claim_resp.deinit(testing.allocator);
     try testing.expectEqual(@as(u16, 200), claim_resp.status_code);
-    try testing.expect(std.mem.indexOf(u8, claim_resp.body, "task-0") != null);
     try testing.expect(std.mem.indexOf(u8, claim_resp.body, "do_something") != null);
 
-    // 3. Complete the task
+    // Extract the auto-generated task id from the claim response.
+    const task_id = extractTaskId(claim_resp.body) orelse return error.MissingTaskId;
+    defer testing.allocator.free(task_id);
+
+    // 3. Complete the task using the claimed task id.
+    const complete_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/outbox/{s}/complete", .{task_id});
+    defer testing.allocator.free(complete_path);
     var complete_resp = try ctx.requestWithAuth(
         .POST,
-        "/v1/agents/agent-0/outbox/task-0/complete",
+        complete_path,
         "{\"result\": \"done\"}",
         "Bearer default-secret-please-change",
     );
@@ -305,19 +315,103 @@ test "read outbox after completing a task" {
     var claim = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
     defer claim.deinit(testing.allocator);
 
-    var complete_resp = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/outbox/task-0/complete", "{\"result\": \"ok\"}", "Bearer default-secret-please-change");
+    // Use the auto-generated task id from the claim response to complete.
+    const task_id = extractTaskId(claim.body) orelse return error.MissingTaskId;
+    defer testing.allocator.free(task_id);
+    const complete_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/outbox/{s}/complete", .{task_id});
+    defer testing.allocator.free(complete_path);
+    var complete_resp = try ctx.requestWithAuth(.POST, complete_path, "{\"result\": \"ok\"}", "Bearer default-secret-please-change");
     defer complete_resp.deinit(testing.allocator);
 
     // Read outbox
     var outbox = try ctx.requestWithAuth(.GET, "/v1/agents/agent-0/outbox", "", "Bearer default-secret-please-change");
     defer outbox.deinit(testing.allocator);
     try testing.expectEqual(@as(u16, 200), outbox.status_code);
-    try testing.expect(std.mem.indexOf(u8, outbox.body, "task-0") != null);
+    try testing.expect(std.mem.indexOf(u8, outbox.body, task_id) != null);
+}
+
+test "admin dispatch with workstream_id links follow-up tasks" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // 1. Admin-dispatch a root task (no workstream_id) to agent-0.
+    var root_resp = try ctx.requestWithAuth(
+        .POST,
+        "/admin/dispatch",
+        "{\"agent_id\":\"agent-0\",\"action\":\"generate\",\"payload\":\"{}\"}",
+        "Bearer admin-token-change-me",
+    );
+    defer root_resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), root_resp.status_code);
+    const root_id = extractTaskId(root_resp.body) orelse return error.MissingRootId;
+    defer testing.allocator.free(root_id);
+
+    // 2. Admin-dispatch a follow-up task with workstream_id = root_id.
+    // Build the JSON body manually to avoid fmt brace-escaping for the payload "{}".
+    const follow_body = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"agent_id\":\"agent-0\",\"action\":\"review\",\"payload\":\"{{}}\",\"workstream_id\":\"{s}\"}}",
+        .{root_id},
+    );
+    defer testing.allocator.free(follow_body);
+    var follow_resp = try ctx.requestWithAuth(.POST, "/admin/dispatch", follow_body, "Bearer admin-token-change-me");
+    defer follow_resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), follow_resp.status_code);
+    const follow_id = extractTaskId(follow_resp.body) orelse return error.MissingFollowId;
+    defer testing.allocator.free(follow_id);
+    try testing.expect(!std.mem.eql(u8, root_id, follow_id));
+
+    // 3. Claim the follow-up and verify its workstream_id equals the root id.
+    var claim = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+    defer claim.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), claim.status_code);
+    // The claim should return either root or follow (rowid order); both share
+    // the root's workstream. Verify the workstream_id field is present and
+    // equals root_id.
+    try testing.expect(std.mem.indexOf(u8, claim.body, "workstream_id") != null);
+    // The claim returns the oldest pending task for agent-0. Other tests may
+    // have left stale tasks in the shared on-disk DB, so we claim in a loop
+    // until we find our root or follow-up task and verify its workstream.
+    var found_root = false;
+    var found_follow = false;
+    while (true) {
+        if (std.mem.indexOf(u8, claim.body, root_id) != null) found_root = true;
+        if (std.mem.indexOf(u8, claim.body, follow_id) != null) found_follow = true;
+        // Every claimed task must carry a non-null workstream_id.
+        try testing.expect(std.mem.indexOf(u8, claim.body, "\"workstream_id\":null") == null);
+        if (found_root and found_follow) break;
+        // Claim the next pending task.
+        claim.deinit(testing.allocator);
+        claim = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+        if (claim.status_code == 204) break; // no more tasks
+        try testing.expectEqual(@as(u16, 200), claim.status_code);
+    }
+    try testing.expect(found_root);
+    try testing.expect(found_follow);
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Extract the `task_id` string value from a JSON response body.
+/// Returns a caller-owned slice (allocated via `testing.allocator`), or null
+/// if the field is absent / not a string.
+fn extractTaskId(body: []const u8) ?[]u8 {
+    const key = "\"task_id\"";
+    const start = std.mem.indexOf(u8, body, key) orelse return null;
+    // Find the opening quote of the value.
+    var i = start + key.len;
+    while (i < body.len and (body[i] == ':' or body[i] == ' ' or body[i] == '\t')) : (i += 1) {}
+    if (i >= body.len or body[i] != '"') return null;
+    i += 1;
+    const val_start = i;
+    while (i < body.len and body[i] != '"') : (i += 1) {}
+    if (i > val_start) {
+        return std.testing.allocator.dupe(u8, body[val_start..i]) catch null;
+    }
+    return null;
+}
 
 fn parseStatusCode(bytes: []const u8) ?u16 {
     // Format: "HTTP/1.1 200 OK\r\n..."

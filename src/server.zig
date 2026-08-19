@@ -8,6 +8,7 @@ const fmt = std.fmt;
 const types = @import("types.zig");
 const task_store = @import("store.zig");
 const authn = @import("auth.zig");
+const uuid = @import("uuid.zig");
 const build_options = @import("build_options");
 
 /// Admin API token – set via env var `FRANKY_BOX_ADMIN_TOKEN` or default.
@@ -27,7 +28,6 @@ allocator: std.mem.Allocator,
 io: std.Io,
 store: *task_store.TaskStore,
 agents: std.StringHashMap([]const u8),
-next_dispatch_task_id: u64 = 0,
 
 pub const Server = @This();
 
@@ -191,12 +191,11 @@ fn handleRegisterAgent(self: *Server, req: *http.Server.Request, _: []const u8) 
 }
 
 fn handleDispatch(self: *Server, req: *http.Server.Request, body: []const u8) !void {
-    // Generate a unique task_id from a monotonic counter.
-    const task_id = try fmt.allocPrint(self.allocator, "task-{d}", .{self.next_dispatch_task_id});
+    // Generate a unique v4 UUID task id.
+    const task_id = try uuid.newV4(self.io, self.allocator);
     defer self.allocator.free(task_id);
-    self.next_dispatch_task_id += 1;
 
-    self.store.dispatch("default-team", "agent-0", task_id, "process", body) catch |err| {
+    self.store.dispatch("default-team", "agent-0", task_id, "process", body, null) catch |err| {
         return errJson(self.allocator, req, .internal_server_error, @errorName(err));
     };
     const resp = try fmt.allocPrint(self.allocator, "{{\"task_id\":\"{s}\",\"status\":\"dispatched\"}}", .{task_id});
@@ -212,9 +211,13 @@ fn handleClaim(self: *Server, req: *http.Server.Request, agent_id: []const u8) !
         defer claimed.deinit(self.allocator);
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
-        try buf.print(self.allocator, "{{\"task_id\":\"{s}\",\"action\":\"{s}\",\"payload\":", .{claimed.task_id, claimed.action});
+        try buf.print(self.allocator, "{{\"task_id\":\"{s}\",\"action\":\"{s}\",\"payload\":", .{ claimed.task_id, claimed.action });
         try jsonPayload(&buf, self.allocator, claimed.payload);
-        try buf.print(self.allocator, ",\"try_count\":{d}}}", .{claimed.try_count});
+        try buf.print(self.allocator, ",\"try_count\":{d}", .{claimed.try_count});
+        // Workstream linkage (optional).
+        try buf.appendSlice(self.allocator, ",");
+        try emitOptField(&buf, self.allocator, "workstream_id", claimed.workstream_id);
+        try buf.appendSlice(self.allocator, "}");
         try json(req, .ok, buf.items);
     } else {
         try json(req, .no_content, "{}");
@@ -267,7 +270,9 @@ fn handleReadOutbox(self: *Server, req: *http.Server.Request, agent_id: []const 
         try jsonPayload(&buf, a, r.payload);
         try buf.appendSlice(a, ",\"output\":");
         try jsonPayload(&buf, a, r.output);
-        try buf.print(a, ",\"completed_at\":\"{s}\"}}", .{r.completed_at});
+        try buf.print(a, ",\"completed_at\":\"{s}\",", .{r.completed_at});
+        try emitOptField(&buf, a, "workstream_id", r.workstream_id);
+        try buf.appendSlice(a, "}");
     }
     try buf.appendSlice(a, "]");
     try json(req, .ok, buf.items);
@@ -359,7 +364,9 @@ fn handleAdminInboxApi(self: *Server, req: *http.Server.Request) !void {
         const locked_s = if (t.locked_until) |lu| lu else "null";
         try buf.print(a, "{{\"task_id\":\"{s}\",\"agent_id\":\"{s}\",\"tenant_id\":\"{s}\",\"action\":\"{s}\",\"payload\":", .{t.task_id, t.agent_id, t.tenant_id, t.action});
         try jsonPayload(&buf, a, t.payload);
-        try buf.print(a, ",\"try_count\":{d},\"locked_until\":\"{s}\"}}", .{ t.try_count, locked_s });
+        try buf.print(a, ",\"try_count\":{d},\"locked_until\":\"{s}\",", .{ t.try_count, locked_s });
+        try emitOptField(&buf, a, "workstream_id", t.workstream_id);
+        try buf.appendSlice(a, "}");
     }
     try buf.appendSlice(a, "]}");
     try json(req, .ok, buf.items);
@@ -381,7 +388,9 @@ fn handleAdminOutboxApi(self: *Server, req: *http.Server.Request) !void {
         try jsonPayload(&buf, a, t.payload);
         try buf.appendSlice(a, ",\"output\":");
         try jsonPayload(&buf, a, t.output);
-        try buf.print(a, ",\"completed_at\":\"{s}\"}}", .{t.completed_at});
+        try buf.print(a, ",\"completed_at\":\"{s}\",", .{t.completed_at});
+        try emitOptField(&buf, a, "workstream_id", t.workstream_id);
+        try buf.appendSlice(a, "}");
     }
     try buf.appendSlice(a, "]}");
     try json(req, .ok, buf.items);
@@ -390,7 +399,7 @@ fn handleAdminOutboxApi(self: *Server, req: *http.Server.Request) !void {
 fn handleAdminDispatch(self: *Server, req: *http.Server.Request, body: []const u8) !void {
     if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
     const a = self.allocator;
-    // Parse JSON body: { "agent_id": "...", "action": "...", "payload": "..." or {...} }
+    // Parse JSON body: { "agent_id": "...", "action": "...", "payload": "...", "workstream_id": "..." }
     // We use a simple approach – extract fields via json scanning.
     const agent_id = extractJsonField(body, "agent_id", a) orelse return errJson(a, req, .bad_request, "missing agent_id");
     defer a.free(agent_id);
@@ -398,15 +407,28 @@ fn handleAdminDispatch(self: *Server, req: *http.Server.Request, body: []const u
     defer a.free(action);
     const payload_raw = extractJsonField(body, "payload", a) orelse return errJson(a, req, .bad_request, "missing payload");
     defer a.free(payload_raw);
+    // Optional: link this task into an existing workstream (follow-up / continuation).
+    // A present-but-null or missing field seeds a new workstream with the task's own id.
+    const workstream_raw = extractJsonField(body, "workstream_id", a);
+    defer if (workstream_raw) |w| a.free(w);
+    var workstream_id: ?[]const u8 = null;
+    if (workstream_raw) |w| {
+        // extractJsonField returns the raw token; strip surrounding quotes if present.
+        if (w.len >= 2 and w[0] == '"' and w[w.len - 1] == '"') {
+            workstream_id = w[1 .. w.len - 1];
+        } else if (w.len > 0 and !mem.eql(u8, w, "null")) {
+            workstream_id = w;
+        }
+    }
 
     // Check agent exists
     if (!self.agents.contains(agent_id)) return errJson(a, req, .bad_request, "unknown agent");
 
-    const task_id = try fmt.allocPrint(a, "task-{d}", .{self.next_dispatch_task_id});
+    // Generate a unique v4 UUID task id.
+    const task_id = try uuid.newV4(self.io, a);
     defer a.free(task_id);
-    self.next_dispatch_task_id += 1;
 
-    self.store.dispatch("default-team", agent_id, task_id, action, payload_raw) catch |err| {
+    self.store.dispatch("default-team", agent_id, task_id, action, payload_raw, workstream_id) catch |err| {
         return errJson(a, req, .internal_server_error, @errorName(err));
     };
     const resp = try fmt.allocPrint(a, "{{\"task_id\":\"{s}\",\"status\":\"dispatched\"}}", .{task_id});
@@ -427,6 +449,15 @@ fn handleAdminRegisterAgent(self: *Server, req: *http.Server.Request) !void {
     const resp = try fmt.allocPrint(a, "{{\"agent_id\":\"{s}\",\"agent_secret\":\"{s}\",\"team_id\":\"default\"}}", .{ agent_id, secret });
     defer a.free(resp);
     try json(req, .ok, resp);
+}
+
+/// Emit a JSON key/value pair for an optional string field: `"key":"value"` or `"key":null`.
+fn emitOptField(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, key: []const u8, value: ?[]const u8) !void {
+    if (value) |v| {
+        try buf.print(allocator, "\"{s}\":\"{s}\"", .{ key, v });
+    } else {
+        try buf.print(allocator, "\"{s}\":null", .{key});
+    }
 }
 
 /// Emit a payload value as valid JSON: if it looks like a JSON object/array emit raw, otherwise quote+escape.

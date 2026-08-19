@@ -16,6 +16,10 @@ pub const TaskStore = struct {
             task_id: []const u8,
             action: []const u8,
             payload: []const u8,
+            /// When non-null, links this task into an existing workstream
+            /// (follow-up / continuation of another task). When null the
+            /// task seeds a new workstream with its own task_id.
+            workstream_id: ?[]const u8,
         ) anyerror!void,
         claim: *const fn (
             ctx: *anyopaque,
@@ -61,8 +65,8 @@ pub const TaskStore = struct {
         self.vtable.deinit(self.ctx);
     }
 
-    pub fn dispatch(self: TaskStore, tenant_id: []const u8, agent_id: []const u8, task_id: []const u8, action: []const u8, payload: []const u8) !void {
-        return self.vtable.dispatch(self.ctx, tenant_id, agent_id, task_id, action, payload);
+    pub fn dispatch(self: TaskStore, tenant_id: []const u8, agent_id: []const u8, task_id: []const u8, action: []const u8, payload: []const u8, workstream_id: ?[]const u8) !void {
+        return self.vtable.dispatch(self.ctx, tenant_id, agent_id, task_id, action, payload, workstream_id);
     }
 
     pub fn claim(self: TaskStore, allocator: std.mem.Allocator, tenant_id: []const u8, agent_id: []const u8) !?types.ClaimResult {
