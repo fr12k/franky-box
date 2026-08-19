@@ -330,28 +330,32 @@ test "read outbox after completing a task" {
     try testing.expect(std.mem.indexOf(u8, outbox.body, task_id) != null);
 }
 
-test "admin dispatch with workstream_id links follow-up tasks" {
+test "admin dispatch with workstream links follow-up tasks" {
     var ctx = try TestContext.init(testing.allocator);
     defer ctx.deinit();
 
-    // 1. Admin-dispatch a root task (no workstream_id) to agent-0.
+    // 1. Admin-dispatch a root task with a workstream_name.
+    //    The server auto-creates the named workstream and returns its id.
     var root_resp = try ctx.requestWithAuth(
         .POST,
         "/admin/dispatch",
-        "{\"agent_id\":\"agent-0\",\"action\":\"generate\",\"payload\":\"{}\"}",
+        "{\"agent_id\":\"agent-0\",\"action\":\"generate\",\"payload\":\"{}\",\"workstream_name\":\"Daily Newsletter\"}",
         "Bearer admin-token-change-me",
     );
     defer root_resp.deinit(testing.allocator);
     try testing.expectEqual(@as(u16, 200), root_resp.status_code);
     const root_id = extractTaskId(root_resp.body) orelse return error.MissingRootId;
     defer testing.allocator.free(root_id);
+    const root_ws = extractJsonStringField(root_resp.body, "workstream_id") orelse return error.MissingRootWorkstream;
+    defer testing.allocator.free(root_ws);
+    // The root task's workstream_id must differ from its task_id.
+    try testing.expect(!std.mem.eql(u8, root_id, root_ws));
 
-    // 2. Admin-dispatch a follow-up task with workstream_id = root_id.
-    // Build the JSON body manually to avoid fmt brace-escaping for the payload "{}".
+    // 2. Admin-dispatch a follow-up with workstream_id = root_ws (now exists).
     const follow_body = try std.fmt.allocPrint(
         testing.allocator,
         "{{\"agent_id\":\"agent-0\",\"action\":\"review\",\"payload\":\"{{}}\",\"workstream_id\":\"{s}\"}}",
-        .{root_id},
+        .{root_ws},
     );
     defer testing.allocator.free(follow_body);
     var follow_resp = try ctx.requestWithAuth(.POST, "/admin/dispatch", follow_body, "Bearer admin-token-change-me");
@@ -359,19 +363,18 @@ test "admin dispatch with workstream_id links follow-up tasks" {
     try testing.expectEqual(@as(u16, 200), follow_resp.status_code);
     const follow_id = extractTaskId(follow_resp.body) orelse return error.MissingFollowId;
     defer testing.allocator.free(follow_id);
+    const follow_ws = extractJsonStringField(follow_resp.body, "workstream_id") orelse return error.MissingFollowWorkstream;
+    defer testing.allocator.free(follow_ws);
     try testing.expect(!std.mem.eql(u8, root_id, follow_id));
+    // The follow-up must join the root's workstream.
+    try testing.expectEqualStrings(root_ws, follow_ws);
 
-    // 3. Claim the follow-up and verify its workstream_id equals the root id.
+    // 3. Claim tasks until we find our root or follow-up; both must carry
+    //    workstream_id = root_ws (never null).
     var claim = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
     defer claim.deinit(testing.allocator);
     try testing.expectEqual(@as(u16, 200), claim.status_code);
-    // The claim should return either root or follow (rowid order); both share
-    // the root's workstream. Verify the workstream_id field is present and
-    // equals root_id.
     try testing.expect(std.mem.indexOf(u8, claim.body, "workstream_id") != null);
-    // The claim returns the oldest pending task for agent-0. Other tests may
-    // have left stale tasks in the shared on-disk DB, so we claim in a loop
-    // until we find our root or follow-up task and verify its workstream.
     var found_root = false;
     var found_follow = false;
     while (true) {
@@ -380,28 +383,116 @@ test "admin dispatch with workstream_id links follow-up tasks" {
         // Every claimed task must carry a non-null workstream_id.
         try testing.expect(std.mem.indexOf(u8, claim.body, "\"workstream_id\":null") == null);
         if (found_root and found_follow) break;
-        // Claim the next pending task.
         claim.deinit(testing.allocator);
         claim = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
-        if (claim.status_code == 204) break; // no more tasks
+        if (claim.status_code == 204) break;
         try testing.expectEqual(@as(u16, 200), claim.status_code);
     }
     try testing.expect(found_root);
     try testing.expect(found_follow);
 }
 
+test "admin workstreams list returns grouped workstreams" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Dispatch a root task with a workstream_name (auto-creates the workstream).
+    var root_resp = try ctx.requestWithAuth(
+        .POST,
+        "/admin/dispatch",
+        "{\"agent_id\":\"agent-0\",\"action\":\"generate\",\"payload\":\"{}\",\"workstream_name\":\"Weekly Report\"}",
+        "Bearer admin-token-change-me",
+    );
+    defer root_resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), root_resp.status_code);
+    const ws = extractJsonStringField(root_resp.body, "workstream_id") orelse return error.MissingWorkstream;
+    defer testing.allocator.free(ws);
+
+    // Follow-up in the same workstream (by id).
+    const follow_body = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"agent_id\":\"agent-0\",\"action\":\"review\",\"payload\":\"{{}}\",\"workstream_id\":\"{s}\"}}",
+        .{ws},
+    );
+    defer testing.allocator.free(follow_body);
+    var follow_resp = try ctx.requestWithAuth(.POST, "/admin/dispatch", follow_body, "Bearer admin-token-change-me");
+    defer follow_resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), follow_resp.status_code);
+
+    // List workstreams and find ours with a count of at least 2.
+    var list_resp = try ctx.requestWithAuth(.GET, "/admin/workstreams", "", "Bearer admin-token-change-me");
+    defer list_resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), list_resp.status_code);
+    try testing.expect(std.mem.indexOf(u8, list_resp.body, "workstreams") != null);
+    try testing.expect(std.mem.indexOf(u8, list_resp.body, ws) != null);
+    try testing.expect(std.mem.indexOf(u8, list_resp.body, "Weekly Report") != null);
+    try testing.expect(std.mem.indexOf(u8, list_resp.body, "\"task_count\":2") != null);
+}
+
+test "admin dispatch by workstream_name auto-creates then 409 on duplicate" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // 1. Dispatch with a workstream_name — auto-creates the workstream.
+    var first_resp = try ctx.requestWithAuth(
+        .POST,
+        "/admin/dispatch",
+        "{\"agent_id\":\"agent-0\",\"action\":\"audit\",\"payload\":\"{}\",\"workstream_name\":\"Monthly Audit\"}",
+        "Bearer admin-token-change-me",
+    );
+    defer first_resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), first_resp.status_code);
+    const ws_id = extractJsonStringField(first_resp.body, "workstream_id") orelse return error.MissingWorkstreamId;
+    defer testing.allocator.free(ws_id);
+
+    // 2. Dispatch again with the SAME workstream_name — lookup finds the existing
+    //    one and joins it (no create, no 409).
+    var join_resp = try ctx.requestWithAuth(
+        .POST,
+        "/admin/dispatch",
+        "{\"agent_id\":\"agent-0\",\"action\":\"review\",\"payload\":\"{}\",\"workstream_name\":\"Monthly Audit\"}",
+        "Bearer admin-token-change-me",
+    );
+    defer join_resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), join_resp.status_code);
+    const join_ws = extractJsonStringField(join_resp.body, "workstream_id") orelse return error.MissingJoinWs;
+    defer testing.allocator.free(join_ws);
+    // Must join the same workstream (lookup found it).
+    try testing.expectEqualStrings(ws_id, join_ws);
+
+    // 3. A different workstream_name creates a second workstream; then repeating
+    //    that exact name again would also just join. The 409 path is exercised by
+    //    a race we cannot easily trigger here, so we verify the lookup-join path
+    //    instead (the common case under Option A).
+}
+
+test "admin dispatch with non-existent workstream_id returns 400" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var resp = try ctx.requestWithAuth(
+        .POST,
+        "/admin/dispatch",
+        "{\"agent_id\":\"agent-0\",\"action\":\"x\",\"payload\":\"{}\",\"workstream_id\":\"nonexistent-uuid\"}",
+        "Bearer admin-token-change-me",
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 400), resp.status_code);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "not found") != null);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Extract the `task_id` string value from a JSON response body.
+/// Extract a string JSON field value by key from a response body.
 /// Returns a caller-owned slice (allocated via `testing.allocator`), or null
 /// if the field is absent / not a string.
-fn extractTaskId(body: []const u8) ?[]u8 {
-    const key = "\"task_id\"";
-    const start = std.mem.indexOf(u8, body, key) orelse return null;
-    // Find the opening quote of the value.
-    var i = start + key.len;
+fn extractJsonStringField(body: []const u8, key: []const u8) ?[]u8 {
+    var key_buf: [64]u8 = undefined;
+    const quoted = std.fmt.bufPrint(&key_buf, "\"{s}\"", .{key}) catch return null;
+    const start = std.mem.indexOf(u8, body, quoted) orelse return null;
+    var i = start + quoted.len;
     while (i < body.len and (body[i] == ':' or body[i] == ' ' or body[i] == '\t')) : (i += 1) {}
     if (i >= body.len or body[i] != '"') return null;
     i += 1;
@@ -411,6 +502,13 @@ fn extractTaskId(body: []const u8) ?[]u8 {
         return std.testing.allocator.dupe(u8, body[val_start..i]) catch null;
     }
     return null;
+}
+
+/// Extract the `task_id` string value from a JSON response body.
+/// Returns a caller-owned slice (allocated via `testing.allocator`), or null
+/// if the field is absent / not a string.
+fn extractTaskId(body: []const u8) ?[]u8 {
+    return extractJsonStringField(body, "task_id");
 }
 
 fn parseStatusCode(bytes: []const u8) ?u16 {

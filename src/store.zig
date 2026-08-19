@@ -59,6 +59,31 @@ pub const TaskStore = struct {
             ctx: *anyopaque,
             allocator: std.mem.Allocator,
         ) anyerror![]types.OutboxResult,
+        /// List all known workstreams with task counts (admin).
+        fetchWorkstreams: *const fn (
+            ctx: *anyopaque,
+            allocator: std.mem.Allocator,
+        ) anyerror![]types.WorkstreamInfo,
+        /// Create a new named workstream. Returns error.DuplicateWorkstreamName
+        /// when the name is already taken.
+        createWorkstream: *const fn (
+            ctx: *anyopaque,
+            allocator: std.mem.Allocator,
+            workstream_id: []const u8,
+            name: []const u8,
+        ) anyerror!types.CreatedWorkstream,
+        /// Look up a workstream by its id. Returns null when not found.
+        lookupWorkstreamById: *const fn (
+            ctx: *anyopaque,
+            allocator: std.mem.Allocator,
+            workstream_id: []const u8,
+        ) anyerror!?types.CreatedWorkstream,
+        /// Look up a workstream by its (unique) name. Returns null when not found.
+        lookupWorkstreamByName: *const fn (
+            ctx: *anyopaque,
+            allocator: std.mem.Allocator,
+            name: []const u8,
+        ) anyerror!?types.CreatedWorkstream,
     };
 
     pub fn deinit(self: TaskStore) void {
@@ -95,5 +120,21 @@ pub const TaskStore = struct {
 
     pub fn fetchOutboxAll(self: TaskStore, allocator: std.mem.Allocator) ![]types.OutboxResult {
         return self.vtable.fetchOutboxAll(self.ctx, allocator);
+    }
+
+    pub fn fetchWorkstreams(self: TaskStore, allocator: std.mem.Allocator) ![]types.WorkstreamInfo {
+        return self.vtable.fetchWorkstreams(self.ctx, allocator);
+    }
+
+    pub fn createWorkstream(self: TaskStore, allocator: std.mem.Allocator, workstream_id: []const u8, name: []const u8) !types.CreatedWorkstream {
+        return self.vtable.createWorkstream(self.ctx, allocator, workstream_id, name);
+    }
+
+    pub fn lookupWorkstreamById(self: TaskStore, allocator: std.mem.Allocator, workstream_id: []const u8) !?types.CreatedWorkstream {
+        return self.vtable.lookupWorkstreamById(self.ctx, allocator, workstream_id);
+    }
+
+    pub fn lookupWorkstreamByName(self: TaskStore, allocator: std.mem.Allocator, name: []const u8) !?types.CreatedWorkstream {
+        return self.vtable.lookupWorkstreamByName(self.ctx, allocator, name);
     }
 };

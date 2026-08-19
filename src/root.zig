@@ -26,6 +26,7 @@ pub const Task = types.Task;
 pub const ClaimResult = types.ClaimResult;
 pub const OutboxResult = types.OutboxResult;
 pub const InboxEntry = types.InboxEntry;
+pub const WorkstreamInfo = types.WorkstreamInfo;
 pub const AgentInfo = types.AgentInfo;
 pub const TaskStore = store.TaskStore;
 pub const SqliteStore = sqlite_store.SqliteStore;

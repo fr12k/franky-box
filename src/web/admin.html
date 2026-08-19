@@ -192,6 +192,7 @@
       <li><a href="#agents" onclick="loadAgents(); closeNav();">Agents</a></li>
       <li><a href="#inbox" onclick="loadInbox(); closeNav();">Inbox</a></li>
       <li><a href="#outbox" onclick="loadOutbox(); closeNav();">Outbox</a></li>
+      <li><a href="#workstreams" onclick="loadWorkstreams(); closeNav();">Workstreams</a></li>
       <li><a href="#dispatch" onclick="showDispatch(); closeNav();">Send Task</a></li>
     </ul>
   </div>
@@ -330,6 +331,33 @@ async function loadOutbox() {
   } catch(e) { el.innerHTML = showToast('error', '❌ ' + escapeHtml(e.message)); }
 }
 
+// ─── Workstreams ────────────────────────────────────────────────
+async function loadWorkstreams() {
+  const el = document.getElementById('content');
+  showLoading();
+  try {
+    const data = await api('/admin/workstreams');
+    let html = '<h2 id="workstreams">🔗 Workstreams</h2>';
+    if (!data.workstreams || data.workstreams.length === 0) {
+      html += '<p>No workstreams yet. Dispatch a task with a workstream name to create one.</p>';
+    } else {
+      html += '<table class="resp-table"><thead><tr><th>Name</th><th>Workstream ID</th><th>Tasks</th><th>Last Activity</th><th>Created</th></tr></thead><tbody>';
+      data.workstreams.forEach(w => {
+        const name = w.name ? escapeHtml(w.name) : '<em>(unnamed)</em>';
+        html += '<tr>'
+          + '<td data-label="Name">' + name + '</td>'
+          + '<td data-label="Workstream ID"><code>' + escapeHtml(w.workstream_id) + '</code></td>'
+          + '<td data-label="Tasks">' + w.task_count + '</td>'
+          + '<td data-label="Last Activity">' + escapeHtml(w.last_seen || '-') + '</td>'
+          + '<td data-label="Created">' + escapeHtml(w.created_at || '-') + '</td>'
+          + '</tr>';
+      });
+      html += '</tbody></table>';
+    }
+    el.innerHTML = html;
+  } catch(e) { el.innerHTML = showToast('error', '❌ ' + escapeHtml(e.message)); }
+}
+
 // ─── Dispatch ────────────────────────────────────────────────────
 function showDispatch() {
   const el = document.getElementById('content');
@@ -345,25 +373,60 @@ function showDispatch() {
       <label>Payload (JSON)
         <textarea id="dispatchPayload" rows="4" required>{"key": "value"}</textarea>
       </label>
-      <label>Workstream ID (optional — leave empty to start a new workstream)
-        <input type="text" id="dispatchWorkstream" placeholder="existing workstream id to continue a chain" />
-      </label>
+      <fieldset style="border:1px solid #ddd;padding:.5rem .75rem;margin-bottom:1rem">
+        <legend style="font-weight:bold">Workstream</legend>
+        <label>Join an existing workstream
+          <select id="dispatchWorkstreamId"><option value="">— none (create new below) —</option></select>
+        </label>
+        <label>…or create a new workstream by name
+          <input type="text" id="dispatchWorkstreamName" placeholder="e.g. Daily Newsletter Summary" maxlength="256" />
+        </label>
+        <small id="workstreamHint" style="display:block;color:#888;margin-top:.25rem">Leave both empty to auto-generate an anonymous workstream.</small>
+      </fieldset>
       <button type="submit">🚀 Dispatch</button>
     </form>
     <div id="dispatchResult"></div>
   `;
+  loadWorkstreamOptions();
 }
+
+async function loadWorkstreamOptions() {
+  const sel = document.getElementById('dispatchWorkstreamId');
+  const hint = document.getElementById('workstreamHint');
+  if (!sel) return;
+  try {
+    const data = await api('/admin/workstreams');
+    if (data.workstreams && data.workstreams.length > 0) {
+      data.workstreams.forEach(w => {
+        const opt = document.createElement('option');
+        opt.value = w.workstream_id;
+        const label = w.name || '(unnamed)';
+        opt.textContent = label + ' — ' + w.task_count + ' tasks (' + w.workstream_id.slice(0, 8) + '…)';
+        sel.appendChild(opt);
+      });
+      if (hint) hint.textContent = 'Pick an existing workstream above, or type a new name to create one (409 if the name is taken).';
+    } else if (hint) {
+      hint.textContent = 'No existing workstreams yet — type a name to create one, or leave empty to auto-generate.';
+    }
+  } catch (e) {
+    if (hint) hint.textContent = 'Could not load workstreams: ' + escapeHtml(e.message);
+  }
+}
+
 async function doDispatch(event) {
   event.preventDefault();
   const el = document.getElementById('dispatchResult');
   const agent = document.getElementById('dispatchAgent').value;
   const action = document.getElementById('dispatchAction').value;
   const payload = document.getElementById('dispatchPayload').value;
-  const workstream = document.getElementById('dispatchWorkstream').value.trim();
+  const wsId = document.getElementById('dispatchWorkstreamId').value.trim();
+  const wsName = document.getElementById('dispatchWorkstreamName').value.trim();
   el.innerHTML = '<div class="spinner"></div>';
   try {
     const body = { agent_id: agent, action: action, payload: payload };
-    if (workstream) body.workstream_id = workstream;
+    // workstream_id takes precedence; otherwise use workstream_name to create-or-join.
+    if (wsId) body.workstream_id = wsId;
+    else if (wsName) body.workstream_name = wsName;
     const r = await fetch('/admin/dispatch', {
       method: 'POST',
       headers: Object.assign(headers(), { 'Content-Type': 'application/json' }),
@@ -371,7 +434,8 @@ async function doDispatch(event) {
     });
     const data = await r.json();
     if (!r.ok) throw new Error(data.error || r.statusText);
-    el.innerHTML = showToast('success', '✅ Task dispatched: <code>' + escapeHtml(data.task_id) + '</code>');
+    const ws = data.workstream_id ? '<br>workstream: <code>' + escapeHtml(data.workstream_id) + '</code>' : '';
+    el.innerHTML = showToast('success', '✅ Task dispatched: <code>' + escapeHtml(data.task_id) + '</code>' + ws);
   } catch(e) { el.innerHTML = showToast('error', '❌ ' + escapeHtml(e.message)); }
   return false;
 }

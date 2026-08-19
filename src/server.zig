@@ -162,6 +162,11 @@ pub fn handleWithPath(self: *Server, req: *http.Server.Request, path: []const u8
         return self.handleAdminOutboxApi(req);
     }
 
+    if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "workstreams")) {
+        if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
+        return self.handleAdminWorkstreamsApi(req);
+    }
+
     if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "dispatch")) {
         if (method != .POST) return errJson(a, req, .method_not_allowed, "method not allowed");
         return self.handleAdminDispatch(req, body);
@@ -191,14 +196,16 @@ fn handleRegisterAgent(self: *Server, req: *http.Server.Request, _: []const u8) 
 }
 
 fn handleDispatch(self: *Server, req: *http.Server.Request, body: []const u8) !void {
-    // Generate a unique v4 UUID task id.
+    // Generate a unique v4 UUID task id and a separate workstream id.
     const task_id = try uuid.newV4(self.io, self.allocator);
     defer self.allocator.free(task_id);
+    const workstream_id = try uuid.newV4(self.io, self.allocator);
+    defer self.allocator.free(workstream_id);
 
-    self.store.dispatch("default-team", "agent-0", task_id, "process", body, null) catch |err| {
+    self.store.dispatch("default-team", "agent-0", task_id, "process", body, workstream_id) catch |err| {
         return errJson(self.allocator, req, .internal_server_error, @errorName(err));
     };
-    const resp = try fmt.allocPrint(self.allocator, "{{\"task_id\":\"{s}\",\"status\":\"dispatched\"}}", .{task_id});
+    const resp = try fmt.allocPrint(self.allocator, "{{\"task_id\":\"{s}\",\"workstream_id\":\"{s}\",\"status\":\"dispatched\"}}", .{ task_id, workstream_id });
     defer self.allocator.free(resp);
     try json(req, .ok, resp);
 }
@@ -396,10 +403,29 @@ fn handleAdminOutboxApi(self: *Server, req: *http.Server.Request) !void {
     try json(req, .ok, buf.items);
 }
 
+fn handleAdminWorkstreamsApi(self: *Server, req: *http.Server.Request) !void {
+    if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
+    const a = self.allocator;
+    const streams = self.store.fetchWorkstreams(a) catch |err| return errJson(a, req, .internal_server_error, @errorName(err));
+    defer { for (streams) |s| s.deinit(a); a.free(streams); }
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.appendSlice(a, "{\"workstreams\":[");
+    var first = true;
+    for (streams) |s| {
+        if (!first) try buf.appendSlice(a, ",");
+        first = false;
+        try buf.print(a, "{{\"workstream_id\":\"{s}\",\"name\":\"{s}\",\"task_count\":{d},\"last_seen\":\"{s}\",\"created_at\":\"{s}\"}}", .{ s.workstream_id, s.name, s.task_count, s.last_seen, s.created_at });
+    }
+    try buf.appendSlice(a, "]}");
+    try json(req, .ok, buf.items);
+}
+
 fn handleAdminDispatch(self: *Server, req: *http.Server.Request, body: []const u8) !void {
     if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
     const a = self.allocator;
-    // Parse JSON body: { "agent_id": "...", "action": "...", "payload": "...", "workstream_id": "..." }
+    // Parse JSON body: { "agent_id": "...", "action": "...", "payload": "...",
+    //                    "workstream_id": "..." | "workstream_name": "..." }
     // We use a simple approach – extract fields via json scanning.
     const agent_id = extractJsonField(body, "agent_id", a) orelse return errJson(a, req, .bad_request, "missing agent_id");
     defer a.free(agent_id);
@@ -407,18 +433,24 @@ fn handleAdminDispatch(self: *Server, req: *http.Server.Request, body: []const u
     defer a.free(action);
     const payload_raw = extractJsonField(body, "payload", a) orelse return errJson(a, req, .bad_request, "missing payload");
     defer a.free(payload_raw);
-    // Optional: link this task into an existing workstream (follow-up / continuation).
-    // A present-but-null or missing field seeds a new workstream with the task's own id.
-    const workstream_raw = extractJsonField(body, "workstream_id", a);
-    defer if (workstream_raw) |w| a.free(w);
-    var workstream_id: ?[]const u8 = null;
-    if (workstream_raw) |w| {
-        // extractJsonField returns the raw token; strip surrounding quotes if present.
-        if (w.len >= 2 and w[0] == '"' and w[w.len - 1] == '"') {
-            workstream_id = w[1 .. w.len - 1];
-        } else if (w.len > 0 and !mem.eql(u8, w, "null")) {
-            workstream_id = w;
-        }
+
+    // Resolve the workstream id. Three modes (first match wins):
+    //   1. workstream_id given  → must already exist (lookup), else 400.
+    //   2. workstream_name given → lookup by name; if found join, if not create + join.
+    //   3. neither given         → generate a fresh workstream UUID (no name row).
+    const ws_id_raw = extractJsonField(body, "workstream_id", a);
+    defer if (ws_id_raw) |w| a.free(w);
+    const ws_name_raw = extractJsonField(body, "workstream_name", a);
+    defer if (ws_name_raw) |w| a.free(w);
+
+    // Strip quotes from the extracted tokens (extractJsonField returns the raw token).
+    var ws_id: ?[]const u8 = null;
+    if (ws_id_raw) |w| {
+        if (w.len >= 2 and w[0] == '"' and w[w.len - 1] == '"') ws_id = w[1 .. w.len - 1] else if (w.len > 0 and !mem.eql(u8, w, "null")) ws_id = w;
+    }
+    var ws_name: ?[]const u8 = null;
+    if (ws_name_raw) |w| {
+        if (w.len >= 2 and w[0] == '"' and w[w.len - 1] == '"') ws_name = w[1 .. w.len - 1] else if (w.len > 0 and !mem.eql(u8, w, "null")) ws_name = w;
     }
 
     // Check agent exists
@@ -428,10 +460,55 @@ fn handleAdminDispatch(self: *Server, req: *http.Server.Request, body: []const u
     const task_id = try uuid.newV4(self.io, a);
     defer a.free(task_id);
 
-    self.store.dispatch("default-team", agent_id, task_id, action, payload_raw, workstream_id) catch |err| {
+    // Resolve the workstream id per the three modes above.
+    var owned_ws: ?[]u8 = null; // for any workstream id we allocate (create case)
+    defer if (owned_ws) |w| a.free(w);
+    const ws: []const u8 = blk: {
+        if (ws_id) |id| {
+            // Mode 1: explicit id — must exist.
+            const lookup = try self.store.lookupWorkstreamById(a, id);
+            if (lookup) |lw| {
+                // lw owns dupes of workstream_id/name/created_at; dupe the id
+                // for our use, then free the rest.
+                owned_ws = try a.dupe(u8, lw.workstream_id);
+                lw.deinit(a);
+                break :blk owned_ws.?;
+            }
+            return errJson(a, req, .bad_request, "workstream_id not found");
+        }
+        if (ws_name) |name| {
+            // Mode 2: name — lookup, then create-or-join.
+            if (name.len > 256) return errJson(a, req, .bad_request, "workstream_name exceeds 256 characters");
+            const lookup = try self.store.lookupWorkstreamByName(a, name);
+            if (lookup) |lw| {
+                owned_ws = try a.dupe(u8, lw.workstream_id);
+                lw.deinit(a);
+                break :blk owned_ws.?;
+            }
+            // Not found — create it. A duplicate name (race or deliberate) → 409.
+            const new_id = try uuid.newV4(self.io, a);
+            owned_ws = new_id;
+            const created = self.store.createWorkstream(a, new_id, name) catch |err| {
+                if (err == error.DuplicateWorkstreamName) {
+                    return errJson(a, req, .conflict, "workstream name already exists");
+                }
+                return errJson(a, req, .internal_server_error, @errorName(err));
+            };
+            // created owns dupes of workstream_id/name/created_at; we only need
+            // the id which is the same new_id we already hold via owned_ws.
+            created.deinit(a);
+            break :blk new_id;
+        }
+        // Mode 3: neither given — generate a fresh anonymous workstream UUID.
+        const new_id = try uuid.newV4(self.io, a);
+        owned_ws = new_id;
+        break :blk new_id;
+    };
+
+    self.store.dispatch("default-team", agent_id, task_id, action, payload_raw, ws) catch |err| {
         return errJson(a, req, .internal_server_error, @errorName(err));
     };
-    const resp = try fmt.allocPrint(a, "{{\"task_id\":\"{s}\",\"status\":\"dispatched\"}}", .{task_id});
+    const resp = try fmt.allocPrint(a, "{{\"task_id\":\"{s}\",\"workstream_id\":\"{s}\",\"status\":\"dispatched\"}}", .{ task_id, ws });
     defer a.free(resp);
     try json(req, .ok, resp);
 }

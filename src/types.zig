@@ -89,6 +89,40 @@ pub const InboxEntry = struct {
     }
 };
 
+/// Summary of a workstream: its id, human-readable name, and how many tasks belong to it.
+/// Used by the admin UI to list/choose existing workstreams when dispatching
+/// a follow-up task. Fields are caller-owned slices.
+pub const WorkstreamInfo = struct {
+    workstream_id: []const u8,
+    name: []const u8,
+    /// Timestamp of the most recent task in this workstream (pending or done).
+    /// May be empty when no tasks carry a timestamp.
+    last_seen: []const u8,
+    task_count: i64,
+    /// When the workstream record was created (ISO8601).
+    created_at: []const u8,
+
+    pub fn deinit(self: WorkstreamInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.workstream_id);
+        allocator.free(self.name);
+        allocator.free(self.last_seen);
+        allocator.free(self.created_at);
+    }
+};
+
+/// A newly-created workstream (returned by createWorkstream).
+pub const CreatedWorkstream = struct {
+    workstream_id: []const u8,
+    name: []const u8,
+    created_at: []const u8,
+
+    pub fn deinit(self: CreatedWorkstream, allocator: std.mem.Allocator) void {
+        allocator.free(self.workstream_id);
+        allocator.free(self.name);
+        allocator.free(self.created_at);
+    }
+};
+
 /// Agent registration info.
 pub const AgentInfo = struct {
     agent_id: []const u8,
