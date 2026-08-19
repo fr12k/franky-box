@@ -110,19 +110,6 @@ pub const WorkstreamInfo = struct {
     }
 };
 
-/// A newly-created workstream (returned by createWorkstream).
-pub const CreatedWorkstream = struct {
-    workstream_id: []const u8,
-    name: []const u8,
-    created_at: []const u8,
-
-    pub fn deinit(self: CreatedWorkstream, allocator: std.mem.Allocator) void {
-        allocator.free(self.workstream_id);
-        allocator.free(self.name);
-        allocator.free(self.created_at);
-    }
-};
-
 /// Agent registration info.
 pub const AgentInfo = struct {
     agent_id: []const u8,

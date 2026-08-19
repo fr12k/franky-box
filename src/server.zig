@@ -196,16 +196,15 @@ fn handleRegisterAgent(self: *Server, req: *http.Server.Request, _: []const u8) 
 }
 
 fn handleDispatch(self: *Server, req: *http.Server.Request, body: []const u8) !void {
-    // Generate a unique v4 UUID task id and a separate workstream id.
+    // Generate a unique v4 UUID task id. The store seeds workstream_id from
+    // the task_id when none is given (anonymous root workstream).
     const task_id = try uuid.newV4(self.io, self.allocator);
     defer self.allocator.free(task_id);
-    const workstream_id = try uuid.newV4(self.io, self.allocator);
-    defer self.allocator.free(workstream_id);
 
-    self.store.dispatch("default-team", "agent-0", task_id, "process", body, workstream_id) catch |err| {
+    self.store.dispatch("default-team", "agent-0", task_id, "process", body, null) catch |err| {
         return errJson(self.allocator, req, .internal_server_error, @errorName(err));
     };
-    const resp = try fmt.allocPrint(self.allocator, "{{\"task_id\":\"{s}\",\"workstream_id\":\"{s}\",\"status\":\"dispatched\"}}", .{ task_id, workstream_id });
+    const resp = try fmt.allocPrint(self.allocator, "{{\"task_id\":\"{s}\",\"workstream_id\":\"{s}\",\"status\":\"dispatched\"}}", .{ task_id, task_id });
     defer self.allocator.free(resp);
     try json(req, .ok, resp);
 }
@@ -446,20 +445,14 @@ fn handleAdminDispatch(self: *Server, req: *http.Server.Request, body: []const u
     //   1. workstream_id given  → must already exist (lookup), else 400.
     //   2. workstream_name given → lookup by name; if found join, if not create + join.
     //   3. neither given         → generate a fresh workstream UUID (no name row).
+    // extractJsonField allocates a raw token; stripJsonString returns a slice into it.
+    // We keep the raw allocation for cleanup and derive the stripped view from it.
     const ws_id_raw = extractJsonField(body, "workstream_id", a);
     defer if (ws_id_raw) |w| a.free(w);
     const ws_name_raw = extractJsonField(body, "workstream_name", a);
     defer if (ws_name_raw) |w| a.free(w);
-
-    // Strip quotes from the extracted tokens (extractJsonField returns the raw token).
-    var ws_id: ?[]const u8 = null;
-    if (ws_id_raw) |w| {
-        if (w.len >= 2 and w[0] == '"' and w[w.len - 1] == '"') ws_id = w[1 .. w.len - 1] else if (w.len > 0 and !mem.eql(u8, w, "null")) ws_id = w;
-    }
-    var ws_name: ?[]const u8 = null;
-    if (ws_name_raw) |w| {
-        if (w.len >= 2 and w[0] == '"' and w[w.len - 1] == '"') ws_name = w[1 .. w.len - 1] else if (w.len > 0 and !mem.eql(u8, w, "null")) ws_name = w;
-    }
+    const ws_id = stripJsonString(ws_id_raw);
+    const ws_name = stripJsonString(ws_name_raw);
 
     // Check agent exists
     if (!self.agents.contains(agent_id)) return errJson(a, req, .bad_request, "unknown agent");
@@ -469,42 +462,28 @@ fn handleAdminDispatch(self: *Server, req: *http.Server.Request, body: []const u
     defer a.free(task_id);
 
     // Resolve the workstream id per the three modes above.
-    var owned_ws: ?[]u8 = null; // for any workstream id we allocate (create case)
+    // `owned_ws` owns any id we allocate (lookup dupe or new UUID); freed at end.
+    var owned_ws: ?[]u8 = null;
     defer if (owned_ws) |w| a.free(w);
     const ws: []const u8 = blk: {
         if (ws_id) |id| {
             // Mode 1: explicit id — must exist.
-            const lookup = try self.store.lookupWorkstreamById(a, id);
-            if (lookup) |lw| {
-                // lw owns dupes of workstream_id/name/created_at; dupe the id
-                // for our use, then free the rest.
-                owned_ws = try a.dupe(u8, lw.workstream_id);
-                lw.deinit(a);
-                break :blk owned_ws.?;
-            }
+            const found = try self.store.lookupWorkstreamById(a, id);
+            if (found) |fid| { owned_ws = fid; break :blk fid; }
             return errJson(a, req, .bad_request, "workstream_id not found");
         }
         if (ws_name) |name| {
             // Mode 2: name — lookup, then create-or-join.
             if (name.len > 256) return errJson(a, req, .bad_request, "workstream_name exceeds 256 characters");
-            const lookup = try self.store.lookupWorkstreamByName(a, name);
-            if (lookup) |lw| {
-                owned_ws = try a.dupe(u8, lw.workstream_id);
-                lw.deinit(a);
-                break :blk owned_ws.?;
-            }
+            const found = try self.store.lookupWorkstreamByName(a, name);
+            if (found) |fid| { owned_ws = fid; break :blk fid; }
             // Not found — create it. A duplicate name (race or deliberate) → 409.
             const new_id = try uuid.newV4(self.io, a);
             owned_ws = new_id;
-            const created = self.store.createWorkstream(a, new_id, name) catch |err| {
-                if (err == error.DuplicateWorkstreamName) {
-                    return errJson(a, req, .conflict, "workstream name already exists");
-                }
+            self.store.createWorkstream(new_id, name) catch |err| {
+                if (err == error.DuplicateWorkstreamName) return errJson(a, req, .conflict, "workstream name already exists");
                 return errJson(a, req, .internal_server_error, @errorName(err));
             };
-            // created owns dupes of workstream_id/name/created_at; we only need
-            // the id which is the same new_id we already hold via owned_ws.
-            created.deinit(a);
             break :blk new_id;
         }
         // Mode 3: neither given — generate a fresh anonymous workstream UUID.
@@ -584,6 +563,16 @@ fn jsonPayload(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, raw: []con
         }
         try buf.append(allocator, '"');
     }
+}
+
+/// Strip surrounding double-quotes from a raw JSON token and interpret `"null"` as
+/// absent. Returns null when the value is missing, the literal `null`, or empty.
+fn stripJsonString(raw: ?[]const u8) ?[]const u8 {
+    if (raw) |w| {
+        if (w.len >= 2 and w[0] == '"' and w[w.len - 1] == '"') return w[1 .. w.len - 1];
+        if (w.len > 0 and !mem.eql(u8, w, "null")) return w;
+    }
+    return null;
 }
 
 /// Scan for `"<key>":` then extract the value (string, object, or literal).

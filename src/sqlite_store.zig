@@ -308,9 +308,9 @@ pub const SqliteStore = struct {
     /// Create a new named workstream. The workstream_id is provided by the
     /// caller (a freshly-generated UUID). Returns error.DuplicateWorkstreamName
     /// when the name is already taken (UNIQUE constraint).
-    pub fn createWorkstream(self: *SqliteStore, allocator: std.mem.Allocator, workstream_id: []const u8, name: []const u8) !types.CreatedWorkstream {
-        const created_at = try self.now(allocator);
-        errdefer allocator.free(created_at);
+    pub fn createWorkstream(self: *SqliteStore, workstream_id: []const u8, name: []const u8) !void {
+        const created_at = try self.now(self.allocator);
+        defer self.allocator.free(created_at);
         const sql = "INSERT INTO workstreams (workstream_id, name, created_at) VALUES (?, ?, ?)";
         var stmt = try self.db.prepare(sql);
         defer stmt.finalize();
@@ -324,53 +324,31 @@ pub const SqliteStore = struct {
             if (std.mem.indexOf(u8, msg, "UNIQUE") != null) return error.DuplicateWorkstreamName;
             return err;
         };
-        return .{
-            .workstream_id = try allocator.dupe(u8, workstream_id),
-            .name = try allocator.dupe(u8, name),
-            .created_at = created_at,
-        };
     }
 
-    /// Look up a workstream by id. Returns null when not found.
-    pub fn lookupWorkstreamById(self: *SqliteStore, allocator: std.mem.Allocator, workstream_id: []const u8) !?types.CreatedWorkstream {
-        var stmt = try self.db.prepare("SELECT workstream_id, name, created_at FROM workstreams WHERE workstream_id = ?");
+    /// Look up a workstream by id. Returns the workstream_id (caller-owned) or
+    /// null when not found. Falls back to checking tasks.workstream_id so that
+    /// anonymous workstreams (no workstreams row) are still joinable by id.
+    pub fn lookupWorkstreamById(self: *SqliteStore, allocator: std.mem.Allocator, workstream_id: []const u8) !?[]u8 {
+        var stmt = try self.db.prepare("SELECT 1 FROM workstreams WHERE workstream_id = ?");
         defer stmt.finalize();
         try stmt.bindText(1, workstream_id);
-        if (try stmt.step()) {
-            return .{
-                .workstream_id = try allocator.dupe(u8, stmt.columnText(0)),
-                .name = try allocator.dupe(u8, stmt.columnText(1)),
-                .created_at = try allocator.dupe(u8, stmt.columnText(2)),
-            };
-        }
-        // Fallback: an anonymous workstream (no workstreams row) exists if any
-        // task references this workstream_id. Return a minimal record with an
-        // empty name so Mode-1 dispatch can join it.
+        if (try stmt.step()) return try allocator.dupe(u8, workstream_id);
+        // Fallback: an anonymous workstream exists if any task references it.
         var tstmt = try self.db.prepare("SELECT 1 FROM tasks WHERE workstream_id = ? LIMIT 1");
         defer tstmt.finalize();
         try tstmt.bindText(1, workstream_id);
-        if (try tstmt.step()) {
-            return .{
-                .workstream_id = try allocator.dupe(u8, workstream_id),
-                .name = try allocator.dupe(u8, ""),
-                .created_at = try allocator.dupe(u8, ""),
-            };
-        }
+        if (try tstmt.step()) return try allocator.dupe(u8, workstream_id);
         return null;
     }
 
-    /// Look up a workstream by its (unique) name. Returns null when not found.
-    pub fn lookupWorkstreamByName(self: *SqliteStore, allocator: std.mem.Allocator, name: []const u8) !?types.CreatedWorkstream {
-        var stmt = try self.db.prepare("SELECT workstream_id, name, created_at FROM workstreams WHERE name = ?");
+    /// Look up a workstream by its (unique) name. Returns the workstream_id
+    /// (caller-owned) or null when not found.
+    pub fn lookupWorkstreamByName(self: *SqliteStore, allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
+        var stmt = try self.db.prepare("SELECT workstream_id FROM workstreams WHERE name = ?");
         defer stmt.finalize();
         try stmt.bindText(1, name);
-        if (try stmt.step()) {
-            return .{
-                .workstream_id = try allocator.dupe(u8, stmt.columnText(0)),
-                .name = try allocator.dupe(u8, stmt.columnText(1)),
-                .created_at = try allocator.dupe(u8, stmt.columnText(2)),
-            };
-        }
+        if (try stmt.step()) return try allocator.dupe(u8, stmt.columnText(0));
         return null;
     }
 
@@ -399,9 +377,9 @@ pub const SqliteStore = struct {
         .fetchInbox = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator) anyerror![]types.InboxEntry { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.fetchInbox(a); } }.f,
         .fetchOutboxAll = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator) anyerror![]types.OutboxResult { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.fetchOutboxAll(a); } }.f,
         .fetchWorkstreams = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator) anyerror![]types.WorkstreamInfo { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.fetchWorkstreams(a); } }.f,
-        .createWorkstream = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator, id: []const u8, n: []const u8) anyerror!types.CreatedWorkstream { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.createWorkstream(a, id, n); } }.f,
-        .lookupWorkstreamById = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator, id: []const u8) anyerror!?types.CreatedWorkstream { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.lookupWorkstreamById(a, id); } }.f,
-        .lookupWorkstreamByName = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator, n: []const u8) anyerror!?types.CreatedWorkstream { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.lookupWorkstreamByName(a, n); } }.f,
+        .createWorkstream = struct { fn f(ctx: *anyopaque, id: []const u8, n: []const u8) anyerror!void { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.createWorkstream(id, n); } }.f,
+        .lookupWorkstreamById = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator, id: []const u8) anyerror!?[]u8 { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.lookupWorkstreamById(a, id); } }.f,
+        .lookupWorkstreamByName = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator, n: []const u8) anyerror!?[]u8 { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.lookupWorkstreamByName(a, n); } }.f,
     };
 };
 
