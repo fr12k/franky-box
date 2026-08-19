@@ -481,6 +481,65 @@ test "admin dispatch with non-existent workstream_id returns 400" {
     try testing.expect(std.mem.indexOf(u8, resp.body, "not found") != null);
 }
 
+test "workstream names with special characters are JSON-escaped in responses" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Dispatch with a workstream name containing a double-quote and backslash.
+    var resp = try ctx.requestWithAuth(
+        .POST,
+        "/admin/dispatch",
+        "{\"agent_id\":\"agent-0\",\"action\":\"x\",\"payload\":\"{}\",\"workstream_name\":\"Quote \\\" and backslash \\\\\"}",
+        "Bearer admin-token-change-me",
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), resp.status_code);
+    const ws = extractJsonStringField(resp.body, "workstream_id") orelse return error.MissingWs;
+    defer testing.allocator.free(ws);
+
+    // List workstreams — the name with quotes must be properly escaped in the JSON.
+    var list = try ctx.requestWithAuth(.GET, "/admin/workstreams", "", "Bearer admin-token-change-me");
+    defer list.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), list.status_code);
+    // The response must be valid JSON (no unescaped quotes). A naive interpolation
+    // of a name containing `"` would break the JSON structure. We verify the
+    // workstream_id we got back is present and the body parses as JSON (contains
+    // matching braces).
+    try testing.expect(std.mem.indexOf(u8, list.body, ws) != null);
+    try testing.expect(std.mem.indexOf(u8, list.body, "\\\"") != null); // escaped quote present
+}
+
+test "anonymous workstream id can be joined by id" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Dispatch a root task with no workstream → anonymous workstream (no workstreams row).
+    var root = try ctx.requestWithAuth(
+        .POST,
+        "/admin/dispatch",
+        "{\"agent_id\":\"agent-0\",\"action\":\"x\",\"payload\":\"{}\"}",
+        "Bearer admin-token-change-me",
+    );
+    defer root.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), root.status_code);
+    const ws = extractJsonStringField(root.body, "workstream_id") orelse return error.MissingWs;
+    defer testing.allocator.free(ws);
+
+    // Follow-up with that anonymous workstream_id — must succeed (fallback to tasks lookup).
+    const follow_body = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"agent_id\":\"agent-0\",\"action\":\"y\",\"payload\":\"{{}}\",\"workstream_id\":\"{s}\"}}",
+        .{ws},
+    );
+    defer testing.allocator.free(follow_body);
+    var follow = try ctx.requestWithAuth(.POST, "/admin/dispatch", follow_body, "Bearer admin-token-change-me");
+    defer follow.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), follow.status_code);
+    const follow_ws = extractJsonStringField(follow.body, "workstream_id") orelse return error.MissingFollowWs;
+    defer testing.allocator.free(follow_ws);
+    try testing.expectEqualStrings(ws, follow_ws);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

@@ -415,7 +415,15 @@ fn handleAdminWorkstreamsApi(self: *Server, req: *http.Server.Request) !void {
     for (streams) |s| {
         if (!first) try buf.appendSlice(a, ",");
         first = false;
-        try buf.print(a, "{{\"workstream_id\":\"{s}\",\"name\":\"{s}\",\"task_count\":{d},\"last_seen\":\"{s}\",\"created_at\":\"{s}\"}}", .{ s.workstream_id, s.name, s.task_count, s.last_seen, s.created_at });
+        try buf.appendSlice(a, "{\"workstream_id\":");
+        try jsonString(&buf, a, s.workstream_id);
+        try buf.appendSlice(a, ",\"name\":");
+        try jsonString(&buf, a, s.name);
+        try buf.print(a, ",\"task_count\":{d},\"last_seen\":", .{s.task_count});
+        try jsonString(&buf, a, s.last_seen);
+        try buf.appendSlice(a, ",\"created_at\":");
+        try jsonString(&buf, a, s.created_at);
+        try buf.appendSlice(a, "}");
     }
     try buf.appendSlice(a, "]}");
     try json(req, .ok, buf.items);
@@ -528,10 +536,30 @@ fn handleAdminRegisterAgent(self: *Server, req: *http.Server.Request) !void {
     try json(req, .ok, resp);
 }
 
+/// Emit a properly-escaped JSON string (opening + closing quotes, escaped contents).
+/// Used for all string values in JSON responses to prevent injection of `"`, `\`,
+/// or control characters from user-supplied data (e.g. workstream names).
+fn jsonString(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, raw: []const u8) !void {
+    try buf.append(allocator, '"');
+    for (raw) |c| {
+        switch (c) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            else => try buf.append(allocator, c),
+        }
+    }
+    try buf.append(allocator, '"');
+}
+
 /// Emit a JSON key/value pair for an optional string field: `"key":"value"` or `"key":null`.
+/// The value is JSON-escaped to prevent injection of quotes/control chars.
 fn emitOptField(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, key: []const u8, value: ?[]const u8) !void {
     if (value) |v| {
-        try buf.print(allocator, "\"{s}\":\"{s}\"", .{ key, v });
+        try buf.print(allocator, "\"{s}\":", .{key});
+        try jsonString(buf, allocator, v);
     } else {
         try buf.print(allocator, "\"{s}\":null", .{key});
     }

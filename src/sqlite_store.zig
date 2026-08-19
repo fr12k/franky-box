@@ -274,7 +274,7 @@ pub const SqliteStore = struct {
             \\       COALESCE(w.created_at, '') AS created_at
             \\FROM (
             \\   SELECT workstream_id, COUNT(*) AS cnt,
-            \\          COALESCE(MAX(completed_at), MAX(locked_until), '') AS last_seen
+            \\          COALESCE(MAX(COALESCE(completed_at, locked_until)), '') AS last_seen
             \\   FROM tasks
             \\   WHERE workstream_id IS NOT NULL AND workstream_id <> ''
             \\   GROUP BY workstream_id
@@ -317,7 +317,13 @@ pub const SqliteStore = struct {
         try stmt.bindText(1, workstream_id);
         try stmt.bindText(2, name);
         try stmt.bindText(3, created_at);
-        _ = stmt.step() catch return error.DuplicateWorkstreamName;
+        _ = stmt.step() catch |err| {
+            // Distinguish a UNIQUE-constraint violation (duplicate name) from
+            // other SQLite errors (busy/disk-full/IO) by inspecting errmsg.
+            const msg = sqlite.errmsgStr(self.db.handle);
+            if (std.mem.indexOf(u8, msg, "UNIQUE") != null) return error.DuplicateWorkstreamName;
+            return err;
+        };
         return .{
             .workstream_id = try allocator.dupe(u8, workstream_id),
             .name = try allocator.dupe(u8, name),
@@ -335,6 +341,19 @@ pub const SqliteStore = struct {
                 .workstream_id = try allocator.dupe(u8, stmt.columnText(0)),
                 .name = try allocator.dupe(u8, stmt.columnText(1)),
                 .created_at = try allocator.dupe(u8, stmt.columnText(2)),
+            };
+        }
+        // Fallback: an anonymous workstream (no workstreams row) exists if any
+        // task references this workstream_id. Return a minimal record with an
+        // empty name so Mode-1 dispatch can join it.
+        var tstmt = try self.db.prepare("SELECT 1 FROM tasks WHERE workstream_id = ? LIMIT 1");
+        defer tstmt.finalize();
+        try tstmt.bindText(1, workstream_id);
+        if (try tstmt.step()) {
+            return .{
+                .workstream_id = try allocator.dupe(u8, workstream_id),
+                .name = try allocator.dupe(u8, ""),
+                .created_at = try allocator.dupe(u8, ""),
             };
         }
         return null;
