@@ -207,6 +207,12 @@ test "dispatch multiple tasks — each gets a unique task_id" {
     try testing.expect(id1.len > 0);
     try testing.expect(id2.len > 0);
     try testing.expect(!std.mem.eql(u8, id1, id2));
+    // Task ids carry the t_ prefix; workstream ids carry w_.
+    try testing.expect(std.mem.startsWith(u8, id1, "t_"));
+    try testing.expect(std.mem.startsWith(u8, id2, "t_"));
+    const ws1 = extractJsonStringField(r1.body, "workstream_id") orelse return error.MissingWs1;
+    defer testing.allocator.free(ws1);
+    try testing.expect(std.mem.startsWith(u8, ws1, "w_"));
 }
 
 test "dispatch with plain text body (no Content-Type)" {

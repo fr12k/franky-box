@@ -74,7 +74,9 @@ pub const SqliteStore = struct {
     /// `workstream_id` controls workstream linking:
     ///   - when non-null, this task joins that existing workstream (follow-up /
     ///     continuation of another task in the same chain);
-    ///   - when null, the task seeds a new workstream with its own `task_id`.
+    ///   - when null, the task seeds a new workstream with its own `task_id`
+    ///     (only happens for direct store callers; the HTTP server always
+    ///     generates a `w_`-prefixed workstream id).
     ///
     /// Querying `WHERE workstream_id = ?` then returns the whole chain.
     pub fn dispatch(self: *SqliteStore, tenant_id: []const u8, agent_id: []const u8, task_id: []const u8, action: []const u8, payload: []const u8, workstream_id: ?[]const u8) !void {

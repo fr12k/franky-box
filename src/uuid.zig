@@ -25,6 +25,28 @@ pub fn newV4(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
     return format(bytes, allocator);
 }
 
+/// Generate a new v4 UUID with a short type prefix and return a caller-owned
+/// slice. The prefix (e.g. `"t_"` for tasks, `"w_"` for workstreams) makes the
+/// id self-describing at a glance. The stored/passed value is `prefix + uuid`.
+pub fn newPrefixed(io: std.Io, allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
+    const uid = try newV4(io, allocator);
+    defer allocator.free(uid);
+    const out = try allocator.alloc(u8, prefix.len + uid.len);
+    @memcpy(out[0..prefix.len], prefix);
+    @memcpy(out[prefix.len..], uid);
+    return out;
+}
+
+/// Generate a task id: `t_` + v4 UUID (e.g. `t_550e8400-e29b-41d4-a716-446655440000`).
+pub fn newTaskId(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
+    return newPrefixed(io, allocator, "t_");
+}
+
+/// Generate a workstream id: `w_` + v4 UUID (e.g. `w_550e8400-e29b-41d4-a716-446655440000`).
+pub fn newWorkstreamId(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
+    return newPrefixed(io, allocator, "w_");
+}
+
 /// Format 16 raw bytes into the canonical `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` string.
 pub fn format(bytes: [16]u8, allocator: std.mem.Allocator) ![]u8 {
     const out = try allocator.alloc(u8, 36);
@@ -71,4 +93,31 @@ test "uuid v4 is unique across many generations" {
     const b = try newV4(std.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(b);
     try std.testing.expect(!std.mem.eql(u8, a, b));
+}
+
+test "task id has t_ prefix and 38 chars" {
+    const s = try newTaskId(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqual(@as(usize, 38), s.len);
+    try std.testing.expectEqualStrings("t_", s[0..2]);
+    // The UUID portion still has the version nibble at index 14+2=16.
+    try std.testing.expectEqual(@as(u8, '4'), s[16]);
+}
+
+test "workstream id has w_ prefix and 38 chars" {
+    const s = try newWorkstreamId(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(s);
+    try std.testing.expectEqual(@as(usize, 38), s.len);
+    try std.testing.expectEqualStrings("w_", s[0..2]);
+    try std.testing.expectEqual(@as(u8, '4'), s[16]);
+}
+
+test "task and workstream ids are distinguishable" {
+    const t = try newTaskId(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(t);
+    const w = try newWorkstreamId(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(w);
+    try std.testing.expect(t[0] == 't');
+    try std.testing.expect(w[0] == 'w');
+    try std.testing.expect(!std.mem.eql(u8, t, w));
 }

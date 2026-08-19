@@ -196,15 +196,16 @@ fn handleRegisterAgent(self: *Server, req: *http.Server.Request, _: []const u8) 
 }
 
 fn handleDispatch(self: *Server, req: *http.Server.Request, body: []const u8) !void {
-    // Generate a unique v4 UUID task id. The store seeds workstream_id from
-    // the task_id when none is given (anonymous root workstream).
-    const task_id = try uuid.newV4(self.io, self.allocator);
+    // Generate a unique task id (t_ + UUID) and a separate workstream id (w_ + UUID).
+    const task_id = try uuid.newTaskId(self.io, self.allocator);
     defer self.allocator.free(task_id);
+    const workstream_id = try uuid.newWorkstreamId(self.io, self.allocator);
+    defer self.allocator.free(workstream_id);
 
-    self.store.dispatch("default-team", "agent-0", task_id, "process", body, null) catch |err| {
+    self.store.dispatch("default-team", "agent-0", task_id, "process", body, workstream_id) catch |err| {
         return errJson(self.allocator, req, .internal_server_error, @errorName(err));
     };
-    const resp = try fmt.allocPrint(self.allocator, "{{\"task_id\":\"{s}\",\"workstream_id\":\"{s}\",\"status\":\"dispatched\"}}", .{ task_id, task_id });
+    const resp = try fmt.allocPrint(self.allocator, "{{\"task_id\":\"{s}\",\"workstream_id\":\"{s}\",\"status\":\"dispatched\"}}", .{ task_id, workstream_id });
     defer self.allocator.free(resp);
     try json(req, .ok, resp);
 }
@@ -457,8 +458,8 @@ fn handleAdminDispatch(self: *Server, req: *http.Server.Request, body: []const u
     // Check agent exists
     if (!self.agents.contains(agent_id)) return errJson(a, req, .bad_request, "unknown agent");
 
-    // Generate a unique v4 UUID task id.
-    const task_id = try uuid.newV4(self.io, a);
+    // Generate a unique task id (t_ + v4 UUID).
+    const task_id = try uuid.newTaskId(self.io, a);
     defer a.free(task_id);
 
     // Resolve the workstream id per the three modes above.
@@ -478,7 +479,7 @@ fn handleAdminDispatch(self: *Server, req: *http.Server.Request, body: []const u
             const found = try self.store.lookupWorkstreamByName(a, name);
             if (found) |fid| { owned_ws = fid; break :blk fid; }
             // Not found — create it. A duplicate name (race or deliberate) → 409.
-            const new_id = try uuid.newV4(self.io, a);
+            const new_id = try uuid.newWorkstreamId(self.io, a);
             owned_ws = new_id;
             self.store.createWorkstream(new_id, name) catch |err| {
                 if (err == error.DuplicateWorkstreamName) return errJson(a, req, .conflict, "workstream name already exists");
@@ -486,8 +487,8 @@ fn handleAdminDispatch(self: *Server, req: *http.Server.Request, body: []const u
             };
             break :blk new_id;
         }
-        // Mode 3: neither given — generate a fresh anonymous workstream UUID.
-        const new_id = try uuid.newV4(self.io, a);
+        // Mode 3: neither given — generate a fresh anonymous workstream id (w_ + UUID).
+        const new_id = try uuid.newWorkstreamId(self.io, a);
         owned_ws = new_id;
         break :blk new_id;
     };
