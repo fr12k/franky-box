@@ -20,11 +20,13 @@ pub const server = @import("server.zig");
 pub const box_types = @import("box_types.zig");
 pub const box_client = @import("box_client.zig");
 pub const update = @import("update.zig");
+pub const uuid = @import("uuid.zig");
 
 pub const Task = types.Task;
 pub const ClaimResult = types.ClaimResult;
 pub const OutboxResult = types.OutboxResult;
 pub const InboxEntry = types.InboxEntry;
+pub const WorkstreamInfo = types.WorkstreamInfo;
 pub const AgentInfo = types.AgentInfo;
 pub const TaskStore = store.TaskStore;
 pub const SqliteStore = sqlite_store.SqliteStore;
@@ -36,5 +38,6 @@ test {
     std.testing.refAllDecls(sqlite_store);
     std.testing.refAllDecls(auth);
     std.testing.refAllDecls(box_types);
+    std.testing.refAllDecls(uuid);
     std.testing.refAllDecls(@This());
 }

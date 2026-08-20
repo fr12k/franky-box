@@ -8,6 +8,7 @@ const fmt = std.fmt;
 const types = @import("types.zig");
 const task_store = @import("store.zig");
 const authn = @import("auth.zig");
+const uuid = @import("uuid.zig");
 const build_options = @import("build_options");
 
 /// Admin API token – set via env var `FRANKY_BOX_ADMIN_TOKEN` or default.
@@ -27,7 +28,6 @@ allocator: std.mem.Allocator,
 io: std.Io,
 store: *task_store.TaskStore,
 agents: std.StringHashMap([]const u8),
-next_dispatch_task_id: u64 = 0,
 
 pub const Server = @This();
 
@@ -162,6 +162,11 @@ pub fn handleWithPath(self: *Server, req: *http.Server.Request, path: []const u8
         return self.handleAdminOutboxApi(req);
     }
 
+    if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "workstreams")) {
+        if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
+        return self.handleAdminWorkstreamsApi(req);
+    }
+
     if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "dispatch")) {
         if (method != .POST) return errJson(a, req, .method_not_allowed, "method not allowed");
         return self.handleAdminDispatch(req, body);
@@ -191,15 +196,16 @@ fn handleRegisterAgent(self: *Server, req: *http.Server.Request, _: []const u8) 
 }
 
 fn handleDispatch(self: *Server, req: *http.Server.Request, body: []const u8) !void {
-    // Generate a unique task_id from a monotonic counter.
-    const task_id = try fmt.allocPrint(self.allocator, "task-{d}", .{self.next_dispatch_task_id});
+    // Generate a unique task id (t_ + UUID) and a separate workstream id (w_ + UUID).
+    const task_id = try uuid.newTaskId(self.io, self.allocator);
     defer self.allocator.free(task_id);
-    self.next_dispatch_task_id += 1;
+    const workstream_id = try uuid.newWorkstreamId(self.io, self.allocator);
+    defer self.allocator.free(workstream_id);
 
-    self.store.dispatch("default-team", "agent-0", task_id, "process", body) catch |err| {
+    self.store.dispatch("default-team", "agent-0", task_id, "process", body, workstream_id) catch |err| {
         return errJson(self.allocator, req, .internal_server_error, @errorName(err));
     };
-    const resp = try fmt.allocPrint(self.allocator, "{{\"task_id\":\"{s}\",\"status\":\"dispatched\"}}", .{task_id});
+    const resp = try fmt.allocPrint(self.allocator, "{{\"task_id\":\"{s}\",\"workstream_id\":\"{s}\",\"status\":\"dispatched\"}}", .{ task_id, workstream_id });
     defer self.allocator.free(resp);
     try json(req, .ok, resp);
 }
@@ -212,9 +218,13 @@ fn handleClaim(self: *Server, req: *http.Server.Request, agent_id: []const u8) !
         defer claimed.deinit(self.allocator);
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
-        try buf.print(self.allocator, "{{\"task_id\":\"{s}\",\"action\":\"{s}\",\"payload\":", .{claimed.task_id, claimed.action});
+        try buf.print(self.allocator, "{{\"task_id\":\"{s}\",\"action\":\"{s}\",\"payload\":", .{ claimed.task_id, claimed.action });
         try jsonPayload(&buf, self.allocator, claimed.payload);
-        try buf.print(self.allocator, ",\"try_count\":{d}}}", .{claimed.try_count});
+        try buf.print(self.allocator, ",\"try_count\":{d}", .{claimed.try_count});
+        // Workstream linkage (optional).
+        try buf.appendSlice(self.allocator, ",");
+        try emitOptField(&buf, self.allocator, "workstream_id", claimed.workstream_id);
+        try buf.appendSlice(self.allocator, "}");
         try json(req, .ok, buf.items);
     } else {
         try json(req, .no_content, "{}");
@@ -267,7 +277,9 @@ fn handleReadOutbox(self: *Server, req: *http.Server.Request, agent_id: []const 
         try jsonPayload(&buf, a, r.payload);
         try buf.appendSlice(a, ",\"output\":");
         try jsonPayload(&buf, a, r.output);
-        try buf.print(a, ",\"completed_at\":\"{s}\"}}", .{r.completed_at});
+        try buf.print(a, ",\"completed_at\":\"{s}\",", .{r.completed_at});
+        try emitOptField(&buf, a, "workstream_id", r.workstream_id);
+        try buf.appendSlice(a, "}");
     }
     try buf.appendSlice(a, "]");
     try json(req, .ok, buf.items);
@@ -359,7 +371,9 @@ fn handleAdminInboxApi(self: *Server, req: *http.Server.Request) !void {
         const locked_s = if (t.locked_until) |lu| lu else "null";
         try buf.print(a, "{{\"task_id\":\"{s}\",\"agent_id\":\"{s}\",\"tenant_id\":\"{s}\",\"action\":\"{s}\",\"payload\":", .{t.task_id, t.agent_id, t.tenant_id, t.action});
         try jsonPayload(&buf, a, t.payload);
-        try buf.print(a, ",\"try_count\":{d},\"locked_until\":\"{s}\"}}", .{ t.try_count, locked_s });
+        try buf.print(a, ",\"try_count\":{d},\"locked_until\":\"{s}\",", .{ t.try_count, locked_s });
+        try emitOptField(&buf, a, "workstream_id", t.workstream_id);
+        try buf.appendSlice(a, "}");
     }
     try buf.appendSlice(a, "]}");
     try json(req, .ok, buf.items);
@@ -381,7 +395,35 @@ fn handleAdminOutboxApi(self: *Server, req: *http.Server.Request) !void {
         try jsonPayload(&buf, a, t.payload);
         try buf.appendSlice(a, ",\"output\":");
         try jsonPayload(&buf, a, t.output);
-        try buf.print(a, ",\"completed_at\":\"{s}\"}}", .{t.completed_at});
+        try buf.print(a, ",\"completed_at\":\"{s}\",", .{t.completed_at});
+        try emitOptField(&buf, a, "workstream_id", t.workstream_id);
+        try buf.appendSlice(a, "}");
+    }
+    try buf.appendSlice(a, "]}");
+    try json(req, .ok, buf.items);
+}
+
+fn handleAdminWorkstreamsApi(self: *Server, req: *http.Server.Request) !void {
+    if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
+    const a = self.allocator;
+    const streams = self.store.fetchWorkstreams(a) catch |err| return errJson(a, req, .internal_server_error, @errorName(err));
+    defer { for (streams) |s| s.deinit(a); a.free(streams); }
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.appendSlice(a, "{\"workstreams\":[");
+    var first = true;
+    for (streams) |s| {
+        if (!first) try buf.appendSlice(a, ",");
+        first = false;
+        try buf.appendSlice(a, "{\"workstream_id\":");
+        try jsonString(&buf, a, s.workstream_id);
+        try buf.appendSlice(a, ",\"name\":");
+        try jsonString(&buf, a, s.name);
+        try buf.print(a, ",\"task_count\":{d},\"last_seen\":", .{s.task_count});
+        try jsonString(&buf, a, s.last_seen);
+        try buf.appendSlice(a, ",\"created_at\":");
+        try jsonString(&buf, a, s.created_at);
+        try buf.appendSlice(a, "}");
     }
     try buf.appendSlice(a, "]}");
     try json(req, .ok, buf.items);
@@ -390,7 +432,8 @@ fn handleAdminOutboxApi(self: *Server, req: *http.Server.Request) !void {
 fn handleAdminDispatch(self: *Server, req: *http.Server.Request, body: []const u8) !void {
     if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
     const a = self.allocator;
-    // Parse JSON body: { "agent_id": "...", "action": "...", "payload": "..." or {...} }
+    // Parse JSON body: { "agent_id": "...", "action": "...", "payload": "...",
+    //                    "workstream_id": "..." | "workstream_name": "..." }
     // We use a simple approach – extract fields via json scanning.
     const agent_id = extractJsonField(body, "agent_id", a) orelse return errJson(a, req, .bad_request, "missing agent_id");
     defer a.free(agent_id);
@@ -399,17 +442,61 @@ fn handleAdminDispatch(self: *Server, req: *http.Server.Request, body: []const u
     const payload_raw = extractJsonField(body, "payload", a) orelse return errJson(a, req, .bad_request, "missing payload");
     defer a.free(payload_raw);
 
+    // Resolve the workstream id. Three modes (first match wins):
+    //   1. workstream_id given  → must already exist (lookup), else 400.
+    //   2. workstream_name given → lookup by name; if found join, if not create + join.
+    //   3. neither given         → generate a fresh workstream UUID (no name row).
+    // extractJsonField allocates a raw token; stripJsonString returns a slice into it.
+    // We keep the raw allocation for cleanup and derive the stripped view from it.
+    const ws_id_raw = extractJsonField(body, "workstream_id", a);
+    defer if (ws_id_raw) |w| a.free(w);
+    const ws_name_raw = extractJsonField(body, "workstream_name", a);
+    defer if (ws_name_raw) |w| a.free(w);
+    const ws_id = stripJsonString(ws_id_raw);
+    const ws_name = stripJsonString(ws_name_raw);
+
     // Check agent exists
     if (!self.agents.contains(agent_id)) return errJson(a, req, .bad_request, "unknown agent");
 
-    const task_id = try fmt.allocPrint(a, "task-{d}", .{self.next_dispatch_task_id});
+    // Generate a unique task id (t_ + v4 UUID).
+    const task_id = try uuid.newTaskId(self.io, a);
     defer a.free(task_id);
-    self.next_dispatch_task_id += 1;
 
-    self.store.dispatch("default-team", agent_id, task_id, action, payload_raw) catch |err| {
+    // Resolve the workstream id per the three modes above.
+    // `owned_ws` owns any id we allocate (lookup dupe or new UUID); freed at end.
+    var owned_ws: ?[]u8 = null;
+    defer if (owned_ws) |w| a.free(w);
+    const ws: []const u8 = blk: {
+        if (ws_id) |id| {
+            // Mode 1: explicit id — must exist.
+            const found = try self.store.lookupWorkstreamById(a, id);
+            if (found) |fid| { owned_ws = fid; break :blk fid; }
+            return errJson(a, req, .bad_request, "workstream_id not found");
+        }
+        if (ws_name) |name| {
+            // Mode 2: name — lookup, then create-or-join.
+            if (name.len > 256) return errJson(a, req, .bad_request, "workstream_name exceeds 256 characters");
+            const found = try self.store.lookupWorkstreamByName(a, name);
+            if (found) |fid| { owned_ws = fid; break :blk fid; }
+            // Not found — create it. A duplicate name (race or deliberate) → 409.
+            const new_id = try uuid.newWorkstreamId(self.io, a);
+            owned_ws = new_id;
+            self.store.createWorkstream(new_id, name) catch |err| {
+                if (err == error.DuplicateWorkstreamName) return errJson(a, req, .conflict, "workstream name already exists");
+                return errJson(a, req, .internal_server_error, @errorName(err));
+            };
+            break :blk new_id;
+        }
+        // Mode 3: neither given — generate a fresh anonymous workstream id (w_ + UUID).
+        const new_id = try uuid.newWorkstreamId(self.io, a);
+        owned_ws = new_id;
+        break :blk new_id;
+    };
+
+    self.store.dispatch("default-team", agent_id, task_id, action, payload_raw, ws) catch |err| {
         return errJson(a, req, .internal_server_error, @errorName(err));
     };
-    const resp = try fmt.allocPrint(a, "{{\"task_id\":\"{s}\",\"status\":\"dispatched\"}}", .{task_id});
+    const resp = try fmt.allocPrint(a, "{{\"task_id\":\"{s}\",\"workstream_id\":\"{s}\",\"status\":\"dispatched\"}}", .{ task_id, ws });
     defer a.free(resp);
     try json(req, .ok, resp);
 }
@@ -427,6 +514,35 @@ fn handleAdminRegisterAgent(self: *Server, req: *http.Server.Request) !void {
     const resp = try fmt.allocPrint(a, "{{\"agent_id\":\"{s}\",\"agent_secret\":\"{s}\",\"team_id\":\"default\"}}", .{ agent_id, secret });
     defer a.free(resp);
     try json(req, .ok, resp);
+}
+
+/// Emit a properly-escaped JSON string (opening + closing quotes, escaped contents).
+/// Used for all string values in JSON responses to prevent injection of `"`, `\`,
+/// or control characters from user-supplied data (e.g. workstream names).
+fn jsonString(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, raw: []const u8) !void {
+    try buf.append(allocator, '"');
+    for (raw) |c| {
+        switch (c) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            else => try buf.append(allocator, c),
+        }
+    }
+    try buf.append(allocator, '"');
+}
+
+/// Emit a JSON key/value pair for an optional string field: `"key":"value"` or `"key":null`.
+/// The value is JSON-escaped to prevent injection of quotes/control chars.
+fn emitOptField(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, key: []const u8, value: ?[]const u8) !void {
+    if (value) |v| {
+        try buf.print(allocator, "\"{s}\":", .{key});
+        try jsonString(buf, allocator, v);
+    } else {
+        try buf.print(allocator, "\"{s}\":null", .{key});
+    }
 }
 
 /// Emit a payload value as valid JSON: if it looks like a JSON object/array emit raw, otherwise quote+escape.
@@ -448,6 +564,16 @@ fn jsonPayload(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, raw: []con
         }
         try buf.append(allocator, '"');
     }
+}
+
+/// Strip surrounding double-quotes from a raw JSON token and interpret `"null"` as
+/// absent. Returns null when the value is missing, the literal `null`, or empty.
+fn stripJsonString(raw: ?[]const u8) ?[]const u8 {
+    if (raw) |w| {
+        if (w.len >= 2 and w[0] == '"' and w[w.len - 1] == '"') return w[1 .. w.len - 1];
+        if (w.len > 0 and !mem.eql(u8, w, "null")) return w;
+    }
+    return null;
 }
 
 /// Scan for `"<key>":` then extract the value (string, object, or literal).
