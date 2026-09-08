@@ -148,7 +148,11 @@ pub const Db = struct {
     }
 
     /// Execute a SQL statement that returns no rows (DDL, PRAGMA, etc.).
-    pub fn exec(self: *Db, sql: []const u8) !void {
+    /// Takes a NUL-terminated slice: sqlite3_exec reads until the NUL byte,
+    /// so a plain (non-sentinel) slice would leak adjacent stack/heap bytes
+    /// into the SQL engine. Zig string literals satisfy this automatically;
+    /// runtime-formatted SQL must use `std.fmt.bufPrintZ` / `allocPrintZ`.
+    pub fn exec(self: *Db, sql: [:0]const u8) !void {
         var err_msg: [*c]u8 = null;
         const rc = sqlite3_exec(
             self.handle,

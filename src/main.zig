@@ -25,12 +25,21 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const port: u16 = 8080;
+    var port: u16 = 8080;
     const db_path = "franky-box.db";
 
     // Read admin token from environment, if set
     if (init.environ_map.get("FRANKY_BOX_ADMIN_TOKEN")) |tok| {
         franky.Server.setAdminToken(tok);
+    }
+    // Optional listen port override (FRANKY_BOX_PORT), useful for running a
+    // second instance (e.g. testing a new build) next to the production one.
+    if (init.environ_map.get("FRANKY_BOX_PORT")) |p| {
+        if (std.fmt.parseInt(u16, p, 10)) |parsed| {
+            port = parsed;
+        } else |_| {
+            std.log.warn("invalid FRANKY_BOX_PORT '{s}', using 8080", .{p});
+        }
     }
 
     var store_backend = try franky.SqliteStore.init(allocator, db_path);
@@ -122,6 +131,7 @@ const usage_text =
     \\
     \\Environment:
     \\  FRANKY_BOX_ADMIN_TOKEN     Admin API token (default: admin-token-change-me).
+    \\  FRANKY_BOX_PORT             Listen port override (default: 8080).
     \\  FRANKY_BOX_UPDATE_REPO     owner/name fallback for `update --repo`.
     \\  FRANKY_BOX_UPDATE_BASE_URL Override https://api.github.com (tests).
     \\

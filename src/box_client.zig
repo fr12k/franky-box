@@ -63,7 +63,24 @@ fn claimUrl(self: *BoxClient, allocator: std.mem.Allocator) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/v1/agents/{s}/inbox/claim", .{ self.base_url, self.agent_id });
 }
 
-fn readOutboxUrl(self: *BoxClient, allocator: std.mem.Allocator) ![]const u8 {
+fn readOutboxUrl(self: *BoxClient, allocator: std.mem.Allocator, since: ?[]const u8) ![]const u8 {
+    if (since) |s| {
+        // Percent-encode the cursor: timestamps contain spaces ('%20').
+        var enc: [64]u8 = undefined;
+        var n: usize = 0;
+        for (s) |c| {
+            if (c == ' ') {
+                if (n + 3 > enc.len) return error.CursorTooLong;
+                @memcpy(enc[n .. n + 3], "%20");
+                n += 3;
+            } else {
+                if (n + 1 > enc.len) return error.CursorTooLong;
+                enc[n] = c;
+                n += 1;
+            }
+        }
+        return std.fmt.allocPrint(allocator, "{s}/v1/agents/{s}/outbox?since={s}", .{ self.base_url, self.agent_id, enc[0..n] });
+    }
     return std.fmt.allocPrint(allocator, "{s}/v1/agents/{s}/outbox", .{ self.base_url, self.agent_id });
 }
 
@@ -77,6 +94,31 @@ fn failUrl(self: *BoxClient, allocator: std.mem.Allocator, task_id: []const u8) 
 
 fn resultUrl(self: *BoxClient, allocator: std.mem.Allocator, task_id: []const u8, token: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/v1/results/{s}?token={s}", .{ self.base_url, task_id, token });
+}
+
+fn ackUrl(self: *BoxClient, allocator: std.mem.Allocator, task_id: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}/v1/agents/{s}/outbox/{s}/ack", .{ self.base_url, self.agent_id, task_id });
+}
+
+fn ackAllUrl(self: *BoxClient, allocator: std.mem.Allocator, before: ?[]const u8) ![]const u8 {
+    if (before) |b| {
+        // Percent-encode the bound: timestamps contain spaces ('%20').
+        var enc: [64]u8 = undefined;
+        var n: usize = 0;
+        for (b) |c| {
+            if (c == ' ') {
+                if (n + 3 > enc.len) return error.CursorTooLong;
+                @memcpy(enc[n .. n + 3], "%20");
+                n += 3;
+            } else {
+                if (n + 1 > enc.len) return error.CursorTooLong;
+                enc[n] = c;
+                n += 1;
+            }
+        }
+        return std.fmt.allocPrint(allocator, "{s}/v1/agents/{s}/outbox/ack-all?before={s}", .{ self.base_url, self.agent_id, enc[0..n] });
+    }
+    return std.fmt.allocPrint(allocator, "{s}/v1/agents/{s}/outbox/ack-all", .{ self.base_url, self.agent_id });
 }
 
 // ── Public API ──────────────────────────────────────────────
@@ -208,10 +250,57 @@ pub fn fail(self: *BoxClient, task_id: []const u8, error_json: []const u8) !bool
     return result.status == .ok;
 }
 
-/// Read the outbox for this agent (all completed/failed tasks since the epoch).
-/// Returns the raw JSON bytes (caller must free).
-pub fn readOutbox(self: *BoxClient) ![]const u8 {
-    const url = try readOutboxUrl(self, self.allocator);
+/// Acknowledge (consume) a single outbox result so it is no longer returned
+/// by readOutbox and becomes eligible for archival. Idempotent: acking an
+/// already-consumed result returns true (200) with no change.
+pub fn ack(self: *BoxClient, task_id: []const u8) !bool {
+    const url = try ackUrl(self, self.allocator, task_id);
+    defer self.allocator.free(url);
+
+    var body_writer = std.Io.Writer.Allocating.init(self.allocator);
+    defer body_writer.deinit();
+
+    const result = self.client.fetch(.{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = "",
+        .response_writer = &body_writer.writer,
+        .extra_headers = &self.headers,
+    }) catch |err| {
+        std.log.warn("box_client: ack request failed: {}", .{err});
+        return false;
+    };
+    return result.status == .ok;
+}
+
+/// Acknowledge (consume) all unconsumed results in this agent's outbox.
+/// Pass an optional `before` timestamp (completed_at) to bound the ack; null
+/// acks everything pending. Returns true when the server accepted the ack.
+pub fn ackAll(self: *BoxClient, before: ?[]const u8) !bool {
+    const url = try ackAllUrl(self, self.allocator, before);
+    defer self.allocator.free(url);
+
+    var body_writer = std.Io.Writer.Allocating.init(self.allocator);
+    defer body_writer.deinit();
+
+    const result = self.client.fetch(.{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = "",
+        .response_writer = &body_writer.writer,
+        .extra_headers = &self.headers,
+    }) catch |err| {
+        std.log.warn("box_client: ack-all request failed: {}", .{err});
+        return false;
+    };
+    return result.status == .ok;
+}
+
+/// Read the outbox for this agent. Returns the raw JSON bytes (caller must
+/// free). Pass `since` (the newest completed_at already seen) to poll
+/// incrementally; null returns all unconsumed results.
+pub fn readOutbox(self: *BoxClient, since: ?[]const u8) ![]const u8 {
+    const url = try readOutboxUrl(self, self.allocator, since);
     defer self.allocator.free(url);
 
     var body_writer = std.Io.Writer.Allocating.init(self.allocator);
