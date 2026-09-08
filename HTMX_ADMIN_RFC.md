@@ -449,10 +449,77 @@ SQLite is already vendored under `vendor/`.
 - No new build step. htmx is either a CDN `<script src>` (zero build
   impact) or a vendored `@embedFile` (same as `admin.html` today).
 - No `npm`, no bundler, no Node toolchain. `zig build` is unchanged.
-- Binary size: +~50 KB if htmx is embedded (vs. the ~270 LoC of JS
-  removed from the HTML, which is ~10–15 KB minified). Net near-zero.
+- Binary size: +~50 KB (vendored `htmx.min.js`) minus ~12–15 KB of
+  removed minified JS ≈ net **+35–38 KB** to the single binary. The
+  trade-off is reproducible/offline builds for a ~35 KB size cost.
 
-### 4.5 Tests
+### 4.5 Net line-count impact (measured)
+
+The numbers below are measured from the current code, not estimated:
+
+**Removed (old side):**
+
+| Component | Lines | Notes |
+|---|---|---|
+| `admin.html` `<script>` block | 272 | lines 207–478; the entire vanilla-JS SPA |
+| `extractJsonField` (JSON scanner) | 48 | only caller is `handleAdminDispatch`, which becomes form-encoded |
+| `stripJsonString` | 9 | only caller is `handleAdminDispatch` |
+| **Total removed** | **329** | |
+
+**Added (new side):**
+
+| Component | Lines (est.) | Notes |
+|---|---|---|
+| `htmlEscape` helper | ~15 | one HTML escaper replaces browser `escapeHtml` |
+| `htmlError` helper | ~10 | 4xx/5xx → HTML error fragment for htmx to swap |
+| `formField` helper | ~15 | URL-decode + scan form-encoded body |
+| htmx `<script src>` / `@embedFile` | 1 | the only JS left |
+| **Total added** | **~41** | |
+
+**Net reduction: ~288 lines** (329 removed − 41 added).
+
+| File | Before | After (est.) | Delta |
+|---|---|---|---|
+| `src/web/admin.html` | 479 | ~208 | **−271** |
+| `src/server.zig` | 787 | ~770 | **−17** |
+| **Combined** | **1266** | **~978** | **−288** |
+
+**Where the reduction comes from:**
+
+1. **Browser JS (−272).** This is the entire win. The 18 view-builder
+   functions, the `api()`/`headers()`/`escapeHtml()`/`escapeJson()`
+   helpers, the toast/spinner/mobile-nav code, and the dispatch-form
+   wiring are deleted and replaced by `hx-*` attributes.
+2. **Server JSON input parsing (−57).** `extractJsonField` (48) +
+   `stripJsonString` (9) are deleted because `handleAdminDispatch` takes
+   form-encoded input, parsed by the ~15-line `formField`. The
+   workstream-resolution logic in `handleAdminDispatch` (the bulk of
+   its 72 lines) is unchanged.
+
+**What does NOT shrink — and why the server stays ~the same size:**
+
+The six admin view handlers (Agents 17, Inbox 23, Outbox 26, Archive 26,
+Workstreams 26, Dispatch ~55 after input-parse shrink, RegisterAgent 18)
+are rewritten from "build JSON" to "build HTML". A JSON builder like
+`buf.print("{\"task_id\":\"{s}\"...", .{t.task_id})` becomes an HTML
+builder like `buf.print("<td><code>{s}</code></td>", .{htmlEsc(t.task_id)})`
+— **roughly 1:1 in line count**. HTML escaping replaces JSON escaping at
+the same number of call sites. So the server's admin-handler line count
+is approximately unchanged; the rendering moves from browser to server,
+it does not shrink the server.
+
+The JSON helpers `jsonString` (17), `emitOptField` (10), and `jsonPayload`
+(22) — 49 lines — **stay**, because the untouched `/v1/*` agent API
+still emits JSON and depends on them. They are not removable in this RFC.
+
+**Bottom line:** the net reduction is real (~288 lines) and concentrated
+entirely in the browser and the JSON-input scanner. The server does not
+get smaller — it stops being *duplicated*. A follow-up `src/web/html.zig`
+helper module (table/td/element builders, §Drawbacks 2) could shave a
+further ~30–50 lines off the handlers, but that is not part of the
+initial migration.
+
+### 4.6 Tests
 
 - `tests/integration_test.zig` currently asserts on JSON shapes from
   `/admin/agents` etc. These assertions change to assert on HTML
@@ -475,12 +542,15 @@ SQLite is already vendored under `vendor/`.
    vendoring (§3.6). The alternative (more vanilla JS) is what we have
    today and is the thing being simplified.
 2. **Server-side HTML generation in Zig** is verbose (`buf.print` with
-   `{s}` and manual `htmlEscape`). It is, however, **strictly less**
-   code than the current server-side JSON generation + client-side HTML
-   generation combined, and it removes the duplication. A tiny
+   `{s}` and manual `htmlEscape`). The admin view handlers stay roughly
+   the **same line count** on the server side (JSON→HTML is ~1:1, see
+   §4.5) — the net line reduction comes from deleting the browser JS
+   and the JSON input scanner, not from shrinking the server. The win
+   is eliminating *duplication*, not reducing server code. A tiny
    `std.fmt`-based HTML helper module (`src/web/html.zig`,
-   `element()`, `table()`, `td()`) could further reduce verbosity; this
-   RFC does not require it but leaves room for it.
+   `element()`, `table()`, `td()`) could further reduce handler
+   verbosity by ~30–50 lines; this RFC does not require it but leaves
+   room for it.
 3. **htmx 4 is new** (released 2026-08). Pinning an exact version
    (`@4.0.0`) avoids churn. The `htmx:2:compat` extension exists if any
    2.x-ism ever leaks in, but a greenfield integration should not need
