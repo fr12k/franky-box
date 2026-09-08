@@ -93,13 +93,37 @@ WHERE tenant_id = :tenant_id
 ORDER BY completed_at ASC;
 
 
-D. Dynamic 7-Day Purge (No Background Cron Worker Required)
-Instead of building a background worker daemon that could crash or leak memory, piggyback a deletion query whenever a human dispatches a new task or an agent requests a claim. This keeps your engine 100% self-cleaning without adding external architecture moving parts.
+D. Retire-to-Archive Instead of Hard Deletes (No Background Cron Worker Required)
+Instead of building a background worker daemon that could crash or leak memory, piggyback a retire-and-archive query whenever a human dispatches a new task or an agent requests a claim. This keeps your engine 100% self-cleaning without adding external architecture moving parts.
 
--- Executed passively in the background of standard API calls
-DELETE FROM tasks 
-WHERE completed_at IS NOT NULL 
-  AND datetime(completed_at) <= datetime('now', '-7 days');
+Retention is two-trigger, driven by consumption rather than age alone:
+  1. Inbox items (output IS NULL) are NEVER purged — a task waits until completed/failed or poison-pilled.
+  2. Outbox results are kept as long as they are NOT consumed (consumed_at IS NULL).
+     A consumer marks results consumed via ack:
+       POST /v1/agents/:agent_id/outbox/:task_id/ack        (single)
+       POST /v1/agents/:agent_id/outbox/ack-all?before=ts (batch)
+     readOutbox only returns unconsumed results and honors a ?since= cursor so
+     consumers never re-download what they already saw.
+  3. Consumed results retire to the tasks_archive table after a short grace
+     window (1 hour), so a consumer can still re-read right after acking.
+  4. Safety net: unconsumed results retire after 90 days so a dead consumer
+     cannot leak rows forever. Archived rows are kept forever (queryable via
+     /admin/archive); nothing is ever hard-deleted.
+
+-- Executed passively in the background of standard API calls (idempotent;
+-- a crash between copy and delete converges on the next pass)
+INSERT OR IGNORE INTO tasks_archive (...) SELECT ... FROM tasks WHERE output IS NOT NULL AND (
+     (consumed_at IS NOT NULL AND datetime(consumed_at) <= datetime('now', '-1 hours'))
+  OR (consumed_at IS NULL AND datetime(completed_at) <= datetime('now', '-90 days')));
+DELETE FROM tasks WHERE task_id IN (SELECT task_id FROM tasks_archive);
+-- Archive membership alone decides: a row copied to the archive always leaves
+-- the hot table, even after a crash between the two statements or a late ack.
+
+The same-file archive table keeps the move atomic in one transaction. If a
+separate archive FILE is ever wanted (independent backup/rotation), the move
+can use ATTACH — but note SQLite only guarantees multi-file transaction
+atomicity in rollback-journal mode, not WAL; the converging two-step above is
+the WAL-safe pattern either way.
 
 
 Why this is fundamentally more reliable:

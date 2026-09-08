@@ -192,6 +192,7 @@
       <li><a href="#agents" onclick="loadAgents(); closeNav();">Agents</a></li>
       <li><a href="#inbox" onclick="loadInbox(); closeNav();">Inbox</a></li>
       <li><a href="#outbox" onclick="loadOutbox(); closeNav();">Outbox</a></li>
+      <li><a href="#archive" onclick="loadArchive(); closeNav();">Archive</a></li>
       <li><a href="#workstreams" onclick="loadWorkstreams(); closeNav();">Workstreams</a></li>
       <li><a href="#dispatch" onclick="showDispatch(); closeNav();">Send Task</a></li>
     </ul>
@@ -311,10 +312,11 @@ async function loadOutbox() {
   try {
     const data = await api('/admin/outbox');
     let html = '<h2 id="outbox">📤 Outbox (Completed Tasks)</h2>';
+    html += '<p>Results stay here until a consumer <em>acks</em> them (POST /v1/agents/&lt;id&gt;/outbox/&lt;task&gt;/ack). Consumed results retire to the archive after a grace window.</p>';
     if (!data.tasks || data.tasks.length === 0) {
       html += '<p>No completed tasks.</p>';
     } else {
-      html += '<table class="resp-table"><thead><tr><th>Task ID</th><th>Workstream</th><th>Action</th><th>Payload</th><th>Output</th><th>Completed At</th></tr></thead><tbody>';
+      html += '<table class="resp-table"><thead><tr><th>Task ID</th><th>Workstream</th><th>Action</th><th>Payload</th><th>Output</th><th>Completed At</th><th>Consumed At</th></tr></thead><tbody>';
       data.tasks.forEach(t => {
         html += '<tr>'
           + '<td data-label="Task ID"><code>' + escapeHtml(t.task_id) + '</code></td>'
@@ -323,6 +325,36 @@ async function loadOutbox() {
           + '<td data-label="Payload"><pre>' + escapeJson(t.payload) + '</pre></td>'
           + '<td data-label="Output"><pre>' + escapeJson(t.output) + '</pre></td>'
           + '<td data-label="Completed At">' + escapeHtml(t.completed_at) + '</td>'
+          + '<td data-label="Consumed At">' + (t.consumed_at ? escapeHtml(t.consumed_at) : '<em>waiting for consumer…</em>') + '</td>'
+          + '</tr>';
+      });
+      html += '</tbody></table>';
+    }
+    el.innerHTML = html;
+  } catch(e) { el.innerHTML = showToast('error', '❌ ' + escapeHtml(e.message)); }
+}
+
+// ─── Load Archive ─────────────────────────────────────────────────
+async function loadArchive() {
+  const el = document.getElementById('content');
+  showLoading();
+  try {
+    const data = await api('/admin/archive');
+    let html = '<h2 id="archive">🗄️ Archive (Retired Tasks)</h2>';
+    html += '<p>Consumed (or aged-out) results, kept forever. Nothing is ever hard-deleted.</p>';
+    if (!data.tasks || data.tasks.length === 0) {
+      html += '<p>No archived tasks.</p>';
+    } else {
+      html += '<table class="resp-table"><thead><tr><th>Task ID</th><th>Workstream</th><th>Action</th><th>Payload</th><th>Output</th><th>Completed At</th><th>Consumed At</th></tr></thead><tbody>';
+      data.tasks.forEach(t => {
+        html += '<tr>'
+          + '<td data-label="Task ID"><code>' + escapeHtml(t.task_id) + '</code></td>'
+          + '<td data-label="Workstream"><code>' + escapeHtml(t.workstream_id || '-') + '</code></td>'
+          + '<td data-label="Action">' + escapeHtml(t.action) + '</td>'
+          + '<td data-label="Payload"><pre>' + escapeJson(t.payload) + '</pre></td>'
+          + '<td data-label="Output"><pre>' + escapeJson(t.output) + '</pre></td>'
+          + '<td data-label="Completed At">' + escapeHtml(t.completed_at) + '</td>'
+          + '<td data-label="Consumed At">' + (t.consumed_at ? escapeHtml(t.consumed_at) : '<em>aged out unconsumed</em>') + '</td>'
           + '</tr>';
       });
       html += '</tbody></table>';

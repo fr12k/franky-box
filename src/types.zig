@@ -54,6 +54,9 @@ pub const OutboxResult = struct {
     completed_at: []const u8,
     /// Shared id grouping tasks in the same workstream (nullable).
     workstream_id: ?[]const u8 = null,
+    /// When the result was acknowledged (consumed) by a reader — null while
+    /// the result is still waiting to be picked up.
+    consumed_at: ?[]const u8 = null,
 
     pub fn deinit(self: OutboxResult, allocator: std.mem.Allocator) void {
         allocator.free(self.task_id);
@@ -62,7 +65,17 @@ pub const OutboxResult = struct {
         allocator.free(self.output);
         allocator.free(self.completed_at);
         if (self.workstream_id) |w| allocator.free(w);
+        if (self.consumed_at) |c| allocator.free(c);
     }
+};
+
+/// A result of an ack operation — what changed in the outbox.
+pub const AckResult = struct {
+    /// Number of outbox rows marked consumed.
+    acked: i64,
+    /// Number of outbox rows moved to the archive table by this ack
+    /// (rows that were eligible for retirement already).
+    archived: i64,
 };
 
 /// A row from the inbox — pending/unclaimed tasks.

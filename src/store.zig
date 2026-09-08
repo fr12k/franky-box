@@ -48,6 +48,24 @@ pub const TaskStore = struct {
             task_id: []const u8,
             error_json: []const u8,
         ) anyerror!bool,
+        /// Acknowledge (consume) a single outbox result. Marks the row as
+        /// consumed so it is no longer returned by readOutbox. Returns false
+        /// when the task does not exist or has no output yet (still in inbox).
+        ack: *const fn (
+            ctx: *anyopaque,
+            tenant_id: []const u8,
+            agent_id: []const u8,
+            task_id: []const u8,
+        ) anyerror!bool,
+        /// Acknowledge all unconsumed results in an agent's outbox completed
+        /// at or before `before_timestamp` ("1970-01-01 00:00:00" acks all).
+        /// Returns what was acked and what was retired to the archive.
+        ackAll: *const fn (
+            ctx: *anyopaque,
+            tenant_id: []const u8,
+            agent_id: []const u8,
+            before_timestamp: []const u8,
+        ) anyerror!types.AckResult,
         purge: *const fn (ctx: *anyopaque) anyerror!void,
         /// List all pending inbox tasks (admin).
         fetchInbox: *const fn (
@@ -56,6 +74,11 @@ pub const TaskStore = struct {
         ) anyerror![]types.InboxEntry,
         /// List all completed outbox tasks across all agents (admin).
         fetchOutboxAll: *const fn (
+            ctx: *anyopaque,
+            allocator: std.mem.Allocator,
+        ) anyerror![]types.OutboxResult,
+        /// List archived tasks (retired from the hot outbox), newest first (admin).
+        fetchArchive: *const fn (
             ctx: *anyopaque,
             allocator: std.mem.Allocator,
         ) anyerror![]types.OutboxResult,
@@ -111,6 +134,14 @@ pub const TaskStore = struct {
         return self.vtable.fail(self.ctx, tenant_id, agent_id, task_id, error_json);
     }
 
+    pub fn ack(self: TaskStore, tenant_id: []const u8, agent_id: []const u8, task_id: []const u8) !bool {
+        return self.vtable.ack(self.ctx, tenant_id, agent_id, task_id);
+    }
+
+    pub fn ackAll(self: TaskStore, tenant_id: []const u8, agent_id: []const u8, before_timestamp: []const u8) !types.AckResult {
+        return self.vtable.ackAll(self.ctx, tenant_id, agent_id, before_timestamp);
+    }
+
     pub fn purge(self: TaskStore) !void {
         return self.vtable.purge(self.ctx);
     }
@@ -121,6 +152,10 @@ pub const TaskStore = struct {
 
     pub fn fetchOutboxAll(self: TaskStore, allocator: std.mem.Allocator) ![]types.OutboxResult {
         return self.vtable.fetchOutboxAll(self.ctx, allocator);
+    }
+
+    pub fn fetchArchive(self: TaskStore, allocator: std.mem.Allocator) ![]types.OutboxResult {
+        return self.vtable.fetchArchive(self.ctx, allocator);
     }
 
     pub fn fetchWorkstreams(self: TaskStore, allocator: std.mem.Allocator) ![]types.WorkstreamInfo {

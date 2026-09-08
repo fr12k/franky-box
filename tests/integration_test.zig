@@ -26,6 +26,17 @@ const TestContext = struct {
         db_buf[db_path_noz.len] = 0;
         const db_path: [:0]const u8 = db_buf[0..db_path_noz.len :0];
 
+        // Tests must start from a clean slate: the counter resets every test
+        // run, so a leftover file from a previous run would seed this run's
+        // context with stale tasks. Remove the file (and any WAL/SHM siblings)
+        // before opening.
+        std.Io.Dir.deleteFileAbsolute(std.testing.io, db_path) catch {};
+        var side_buf: [160]u8 = undefined;
+        const wal_path = try std.fmt.bufPrint(&side_buf, "{s}-wal", .{db_path_noz});
+        std.Io.Dir.deleteFileAbsolute(std.testing.io, wal_path) catch {};
+        const shm_path = try std.fmt.bufPrint(&side_buf, "{s}-shm", .{db_path_noz});
+        std.Io.Dir.deleteFileAbsolute(std.testing.io, shm_path) catch {};
+
         var store_backend = try allocator.create(franky.SqliteStore);
         errdefer allocator.destroy(store_backend);
         store_backend.* = try franky.SqliteStore.init(allocator, db_path);
@@ -582,4 +593,201 @@ fn parseStatusCode(bytes: []const u8) ?u16 {
     _ = it.next() orelse return null; // "HTTP/1.1"
     const code_str = it.next() orelse return null;
     return std.fmt.parseUnsigned(u16, code_str, 10) catch null;
+}
+test "ack removes a result from the outbox read" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Dispatch, claim, complete.
+    var dispatch_resp = try ctx.request(.POST, "/v1/tasks/dispatch", "\"ack test\"");
+    defer dispatch_resp.deinit(testing.allocator);
+    var claim = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+    defer claim.deinit(testing.allocator);
+    const task_id = extractTaskId(claim.body) orelse return error.MissingTaskId;
+    defer testing.allocator.free(task_id);
+    const complete_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/outbox/{s}/complete", .{task_id});
+    defer testing.allocator.free(complete_path);
+    var complete_resp = try ctx.requestWithAuth(.POST, complete_path, "{\"result\": \"ok\"}", "Bearer default-secret-please-change");
+    defer complete_resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), complete_resp.status_code);
+
+    // Before ack: the result is readable in the outbox.
+    {
+        var outbox = try ctx.requestWithAuth(.GET, "/v1/agents/agent-0/outbox", "", "Bearer default-secret-please-change");
+        defer outbox.deinit(testing.allocator);
+        try testing.expectEqual(@as(u16, 200), outbox.status_code);
+        try testing.expect(std.mem.indexOf(u8, outbox.body, task_id) != null);
+    }
+
+    // Ack the result.
+    const ack_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/outbox/{s}/ack", .{task_id});
+    defer testing.allocator.free(ack_path);
+    var ack_resp = try ctx.requestWithAuth(.POST, ack_path, "", "Bearer default-secret-please-change");
+    defer ack_resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), ack_resp.status_code);
+    try testing.expect(std.mem.indexOf(u8, ack_resp.body, "\"status\":\"consumed\"") != null);
+
+    // After ack: the result is no longer returned to consumers.
+    {
+        var outbox = try ctx.requestWithAuth(.GET, "/v1/agents/agent-0/outbox", "", "Bearer default-secret-please-change");
+        defer outbox.deinit(testing.allocator);
+        try testing.expectEqual(@as(u16, 200), outbox.status_code);
+        try testing.expect(std.mem.indexOf(u8, outbox.body, task_id) == null);
+    }
+
+    // Re-acking an already-consumed result is idempotent: HTTP 200 with the
+    // original consumed_at preserved (COALESCE), per the documented contract.
+    var ack_resp2 = try ctx.requestWithAuth(.POST, ack_path, "", "Bearer default-secret-please-change");
+    defer ack_resp2.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), ack_resp2.status_code);
+
+    // The consumed result remains visible to the admin outbox view until
+    // it is retired to the archive.
+    {
+        var admin_outbox = try ctx.requestWithAuth(.GET, "/admin/outbox", "", "Bearer admin-token-change-me");
+        defer admin_outbox.deinit(testing.allocator);
+        try testing.expectEqual(@as(u16, 200), admin_outbox.status_code);
+        try testing.expect(std.mem.indexOf(u8, admin_outbox.body, task_id) != null);
+        try testing.expect(std.mem.indexOf(u8, admin_outbox.body, "\"consumed_at\":null") == null); // it IS consumed
+    }
+}
+
+test "ack-all consumes every pending result and reports counts" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Two completed results.
+    for (0..2) |_| {
+        var dispatch_resp = try ctx.request(.POST, "/v1/tasks/dispatch", "\"ack-all test\"");
+        defer dispatch_resp.deinit(testing.allocator);
+        var claim = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+        defer claim.deinit(testing.allocator);
+        const task_id = extractTaskId(claim.body) orelse return error.MissingTaskId;
+        defer testing.allocator.free(task_id);
+        const complete_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/outbox/{s}/complete", .{task_id});
+        defer testing.allocator.free(complete_path);
+        var complete_resp = try ctx.requestWithAuth(.POST, complete_path, "{\"result\": \"ok\"}", "Bearer default-secret-please-change");
+        defer complete_resp.deinit(testing.allocator);
+        try testing.expectEqual(@as(u16, 200), complete_resp.status_code);
+    }
+
+    // Ack everything.
+    var ack_resp = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/outbox/ack-all", "", "Bearer default-secret-please-change");
+    defer ack_resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), ack_resp.status_code);
+    try testing.expect(std.mem.indexOf(u8, ack_resp.body, "\"acked\":2") != null);
+
+    // Outbox read is now empty.
+    {
+        var outbox = try ctx.requestWithAuth(.GET, "/v1/agents/agent-0/outbox", "", "Bearer default-secret-please-change");
+        defer outbox.deinit(testing.allocator);
+        try testing.expectEqual(@as(u16, 200), outbox.status_code);
+        try testing.expectEqualStrings("[]", outbox.body);
+    }
+}
+
+test "outbox read honors the since cursor" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // First result, then backdate it as "already seen" by setting a past
+    // completed_at. The consumer's cursor is 2020-06-01.
+    {
+        var dispatch_resp = try ctx.request(.POST, "/v1/tasks/dispatch", "\"cursor test 1\"");
+        defer dispatch_resp.deinit(testing.allocator);
+        var claim = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+        defer claim.deinit(testing.allocator);
+        const task_id = extractTaskId(claim.body) orelse return error.MissingTaskId;
+        defer testing.allocator.free(task_id);
+        const complete_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/outbox/{s}/complete", .{task_id});
+        defer testing.allocator.free(complete_path);
+        var complete_resp = try ctx.requestWithAuth(.POST, complete_path, "{\"result\": \"ok\"}", "Bearer default-secret-please-change");
+        defer complete_resp.deinit(testing.allocator);
+        try testing.expectEqual(@as(u16, 200), complete_resp.status_code);
+        // Backdate completed_at so the since-cursor filters it out.
+        var stmt = try ctx.store_backend.db.prepare(
+            "UPDATE tasks SET completed_at = '2020-01-01 00:00:00' WHERE task_id = ?",
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, task_id);
+        _ = try stmt.step();
+    }
+
+    // A second, fresh result.
+    var task2_id: []u8 = "";
+    defer if (task2_id.len > 0) testing.allocator.free(task2_id);
+    {
+        var dispatch_resp = try ctx.request(.POST, "/v1/tasks/dispatch", "\"cursor test 2\"");
+        defer dispatch_resp.deinit(testing.allocator);
+        var claim = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+        defer claim.deinit(testing.allocator);
+        const task_id = extractTaskId(claim.body) orelse return error.MissingTaskId;
+        task2_id = task_id;
+        const complete_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/outbox/{s}/complete", .{task_id});
+        defer testing.allocator.free(complete_path);
+        var complete_resp = try ctx.requestWithAuth(.POST, complete_path, "{\"result\": \"ok\"}", "Bearer default-secret-please-change");
+        defer complete_resp.deinit(testing.allocator);
+        try testing.expectEqual(@as(u16, 200), complete_resp.status_code);
+    }
+
+    // Poll with the cursor: only the fresh result comes back.
+    {
+        var outbox = try ctx.requestWithAuth(.GET, "/v1/agents/agent-0/outbox?since=2020-06-01%2000:00:00", "", "Bearer default-secret-please-change");
+        defer outbox.deinit(testing.allocator);
+        try testing.expectEqual(@as(u16, 200), outbox.status_code);
+        try testing.expect(std.mem.indexOf(u8, outbox.body, task2_id) != null);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, outbox.body, "\"task_id\""));
+    }
+}
+
+test "admin archive lists retired tasks" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    // Empty archive initially.
+    {
+        var resp = try ctx.requestWithAuth(.GET, "/admin/archive", "", "Bearer admin-token-change-me");
+        defer resp.deinit(testing.allocator);
+        try testing.expectEqual(@as(u16, 200), resp.status_code);
+        try testing.expectEqualStrings("{\"tasks\":[]}", resp.body);
+    }
+
+    // Complete + ack a task, then backdate consumed_at past the grace window
+    // so the next purge retires it to the archive.
+    var dispatch_resp = try ctx.request(.POST, "/v1/tasks/dispatch", "\"archive test\"");
+    defer dispatch_resp.deinit(testing.allocator);
+    var claim = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+    defer claim.deinit(testing.allocator);
+    const task_id = extractTaskId(claim.body) orelse return error.MissingTaskId;
+    defer testing.allocator.free(task_id);
+    const complete_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/outbox/{s}/complete", .{task_id});
+    defer testing.allocator.free(complete_path);
+    var complete_resp = try ctx.requestWithAuth(.POST, complete_path, "{\"result\": \"ok\"}", "Bearer default-secret-please-change");
+    defer complete_resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), complete_resp.status_code);
+
+    const ack_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/outbox/{s}/ack", .{task_id});
+    defer testing.allocator.free(ack_path);
+    var ack_resp = try ctx.requestWithAuth(.POST, ack_path, "", "Bearer default-secret-please-change");
+    defer ack_resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), ack_resp.status_code);
+
+    {
+        var stmt = try ctx.store_backend.db.prepare(
+            "UPDATE tasks SET consumed_at = datetime('now', '-2 hours') WHERE task_id = ?",
+        );
+        defer stmt.finalize();
+        try stmt.bindText(1, task_id);
+        _ = try stmt.step();
+    }
+
+    // Trigger a purge (dispatch piggybacks it) and verify the archive.
+    var dispatch2 = try ctx.request(.POST, "/v1/tasks/dispatch", "\"purge trigger\"");
+    defer dispatch2.deinit(testing.allocator);
+    {
+        var resp = try ctx.requestWithAuth(.GET, "/admin/archive", "", "Bearer admin-token-change-me");
+        defer resp.deinit(testing.allocator);
+        try testing.expectEqual(@as(u16, 200), resp.status_code);
+        try testing.expect(std.mem.indexOf(u8, resp.body, task_id) != null);
+    }
 }

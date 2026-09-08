@@ -84,9 +84,13 @@ pub fn handle(self: *Server, req: *http.Server.Request, body: []const u8) !void 
     try handleWithPath(self, req, req.head.target, body);
 }
 
-pub fn handleWithPath(self: *Server, req: *http.Server.Request, path: []const u8, body: []const u8) !void {
+pub fn handleWithPath(self: *Server, req: *http.Server.Request, path_with_query: []const u8, body: []const u8) !void {
     const method = req.head.method;
     const a = self.allocator;
+
+    // Split the query string off the target so path routing only sees the
+    // path (segments), and queryParam reads the query part (via head_buffer).
+    const path = if (mem.indexOfScalar(u8, path_with_query, '?')) |q| path_with_query[0..q] else path_with_query;
 
     const segments = parsePath(path, a) catch |err| return errJson(a, req, .internal_server_error, @errorName(err));
     defer a.free(segments);
@@ -114,6 +118,18 @@ pub fn handleWithPath(self: *Server, req: *http.Server.Request, path: []const u8
             if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
             if (!self.requireAgent(agent, req)) return errJson(a, req, .unauthorized, "unauthorized");
             return self.handleReadOutbox(req, agent);
+        }
+
+        if (segments.len >= 6 and isSeg(segments[3], "outbox") and isSeg(segments[5], "ack")) {
+            if (method != .POST) return errJson(a, req, .method_not_allowed, "method not allowed");
+            if (!self.requireAgent(agent, req)) return errJson(a, req, .unauthorized, "unauthorized");
+            return self.handleAck(req, agent, segments[4]);
+        }
+
+        if (segments.len >= 5 and isSeg(segments[3], "outbox") and isSeg(segments[4], "ack-all")) {
+            if (method != .POST) return errJson(a, req, .method_not_allowed, "method not allowed");
+            if (!self.requireAgent(agent, req)) return errJson(a, req, .unauthorized, "unauthorized");
+            return self.handleAckAll(req, agent);
         }
 
         if (segments.len >= 6 and isSeg(segments[3], "outbox") and isSeg(segments[5], "complete")) {
@@ -160,6 +176,11 @@ pub fn handleWithPath(self: *Server, req: *http.Server.Request, path: []const u8
     if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "outbox")) {
         if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
         return self.handleAdminOutboxApi(req);
+    }
+
+    if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "archive")) {
+        if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
+        return self.handleAdminArchiveApi(req);
     }
 
     if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "workstreams")) {
@@ -263,7 +284,18 @@ fn handleFail(self: *Server, req: *http.Server.Request, agent_id: []const u8, ta
 
 fn handleReadOutbox(self: *Server, req: *http.Server.Request, agent_id: []const u8) !void {
     const a = self.allocator;
-    const results = self.store.readOutbox(a, "default-team", agent_id, "1970-01-01 00:00:00") catch |err| {
+    // Honor the ?since=<timestamp> cursor: only results completed after the
+    // given timestamp are returned. Consumers pass the newest completed_at
+    // they have seen to avoid re-downloading the entire outbox each poll.
+    // Missing or empty ?since falls back to the epoch (all unconsumed results)
+    // so a bare `?since=` cannot silently filter everything out.
+    const since_owned = queryParamDup(a, req.head_buffer, "since");
+    defer if (since_owned) |s| a.free(s);
+    var since: []const u8 = "1970-01-01 00:00:00";
+    if (since_owned) |s| {
+        if (s.len > 0) since = s;
+    }
+    const results = self.store.readOutbox(a, "default-team", agent_id, since) catch |err| {
         return errJson(a, req, .internal_server_error, @errorName(err));
     };
     defer { for (results) |r| r.deinit(a); a.free(results); }
@@ -285,6 +317,32 @@ fn handleReadOutbox(self: *Server, req: *http.Server.Request, agent_id: []const 
     try json(req, .ok, buf.items);
 }
 
+fn handleAck(self: *Server, req: *http.Server.Request, agent_id: []const u8, task_id: []const u8) !void {
+    const a = self.allocator;
+    const ok = self.store.ack("default-team", agent_id, task_id) catch |err| {
+        return errJson(a, req, .internal_server_error, @errorName(err));
+    };
+    if (!ok) return errJson(a, req, .not_found, "task not found or not consumable");
+    const resp = try fmt.allocPrint(a, "{{\"task_id\":\"{s}\",\"status\":\"consumed\"}}", .{task_id});
+    defer a.free(resp);
+    try json(req, .ok, resp);
+}
+
+fn handleAckAll(self: *Server, req: *http.Server.Request, agent_id: []const u8) !void {
+    const a = self.allocator;
+    // Optional ?before=<timestamp> bounds the ack: only results completed at
+    // or before that timestamp are consumed (default: ack everything).
+    const before_owned = queryParamDup(a, req.head_buffer, "before");
+    defer if (before_owned) |b| a.free(b);
+    const before: []const u8 = before_owned orelse "9999-12-31 23:59:59";
+    const result = self.store.ackAll("default-team", agent_id, before) catch |err| {
+        return errJson(a, req, .internal_server_error, @errorName(err));
+    };
+    const resp = try fmt.allocPrint(a, "{{\"status\":\"consumed\",\"acked\":{d},\"archived\":{d}}}", .{ result.acked, result.archived });
+    defer a.free(resp);
+    try json(req, .ok, resp);
+}
+
 fn handleGetResult(self: *Server, req: *http.Server.Request, _: []const u8) !void {
     const target = req.head.target;
     const qpos = mem.indexOfScalar(u8, target, '?') orelse return errJson(self.allocator, req, .bad_request, "missing token");
@@ -294,6 +352,81 @@ fn handleGetResult(self: *Server, req: *http.Server.Request, _: []const u8) !voi
 }
 
 fn isSeg(seg: []const u8, lit: []const u8) bool { return mem.eql(u8, seg, lit); }
+
+/// Extract a query-string parameter (?key=value or &key=value) from the raw
+/// request head buffer. The target line (`GET /path?k=v HTTP/1.1`) lives in the
+/// same buffer, so a simple scan is enough. Returns a slice into head_buffer
+/// (no allocation, no URL-decoding — values here are timestamps / ids).
+fn queryParam(head_buffer: []const u8, key: []const u8) ?[]const u8 {
+    // Find the request line's query string first.
+    const line_end = mem.indexOfScalar(u8, head_buffer, '\n') orelse return null;
+    const line = head_buffer[0..line_end];
+    const qpos = mem.indexOfScalar(u8, line, '?') orelse return null;
+    var rest = line[qpos + 1 ..];
+    if (mem.indexOfScalar(u8, rest, ' ')) |sp| rest = rest[0..sp];
+    var it = mem.splitScalar(u8, rest, '&');
+    while (it.next()) |pair| {
+        const eq = mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
+    }
+    return null;
+}
+
+/// Like `queryParam`, but percent-decodes the value ('%20' → space, '+' →
+/// space) into caller-owned allocated memory. Use for values that are not
+/// simple tokens (e.g. timestamps with spaces). Returns null when missing.
+/// The returned slice's length matches the allocation exactly (two-pass
+/// decode-count-then-fill), so `allocator.free` on it is valid.
+fn queryParamDup(a: std.mem.Allocator, head_buffer: []const u8, key: []const u8) ?[]const u8 {
+    const raw = queryParam(head_buffer, key) orelse return null;
+    // Two-pass decode (count, then fill): decoding never expands (%XX → 1
+    // byte, '+' → 1 byte), so pass 1 yields the exact output length and pass 2
+    // allocates exactly that — Zig's allocator.free requires the returned
+    // slice's length to match the allocation, so a realloc-based shrink is
+    // not portable here (realloc must receive the full-length slice).
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < raw.len) {
+        if (raw[i] == '%' and i + 3 <= raw.len) {
+            if (std.fmt.charToDigit(raw[i + 1], 16) catch null) |_| {
+                if (std.fmt.charToDigit(raw[i + 2], 16) catch null) |_| {
+                    n += 1;
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        n += 1;
+        i += 1;
+    }
+    const out = a.alloc(u8, n) catch return null;
+    var o: usize = 0;
+    i = 0;
+    while (i < raw.len) {
+        if (raw[i] == '+') {
+            out[o] = ' ';
+            o += 1;
+            i += 1;
+        } else if (raw[i] == '%' and i + 3 <= raw.len) {
+            if (std.fmt.charToDigit(raw[i + 1], 16) catch null) |hi| {
+                if (std.fmt.charToDigit(raw[i + 2], 16) catch null) |lo| {
+                    out[o] = @intCast(hi * 16 + lo);
+                    o += 1;
+                    i += 3;
+                    continue;
+                }
+            }
+            out[o] = raw[i];
+            o += 1;
+            i += 1;
+        } else {
+            out[o] = raw[i];
+            o += 1;
+            i += 1;
+        }
+    }
+    return out[0..o];
+}
 
 fn requireAdmin(req: *http.Server.Request) bool {
     // Check Authorization header first
@@ -397,6 +530,34 @@ fn handleAdminOutboxApi(self: *Server, req: *http.Server.Request) !void {
         try jsonPayload(&buf, a, t.output);
         try buf.print(a, ",\"completed_at\":\"{s}\",", .{t.completed_at});
         try emitOptField(&buf, a, "workstream_id", t.workstream_id);
+        try buf.appendSlice(a, ",");
+        try emitOptField(&buf, a, "consumed_at", t.consumed_at);
+        try buf.appendSlice(a, "}");
+    }
+    try buf.appendSlice(a, "]}");
+    try json(req, .ok, buf.items);
+}
+
+fn handleAdminArchiveApi(self: *Server, req: *http.Server.Request) !void {
+    if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
+    const a = self.allocator;
+    const tasks = self.store.fetchArchive(a) catch |err| return errJson(a, req, .internal_server_error, @errorName(err));
+    defer { for (tasks) |t| t.deinit(a); a.free(tasks); }
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.appendSlice(a, "{\"tasks\":[");
+    var first = true;
+    for (tasks) |t| {
+        if (!first) try buf.appendSlice(a, ",");
+        first = false;
+        try buf.print(a, "{{\"task_id\":\"{s}\",\"action\":\"{s}\",\"payload\":", .{t.task_id, t.action});
+        try jsonPayload(&buf, a, t.payload);
+        try buf.appendSlice(a, ",\"output\":");
+        try jsonPayload(&buf, a, t.output);
+        try buf.print(a, ",\"completed_at\":\"{s}\",", .{t.completed_at});
+        try emitOptField(&buf, a, "workstream_id", t.workstream_id);
+        try buf.appendSlice(a, ",");
+        try emitOptField(&buf, a, "consumed_at", t.consumed_at);
         try buf.appendSlice(a, "}");
     }
     try buf.appendSlice(a, "]}");
