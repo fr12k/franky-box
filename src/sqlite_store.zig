@@ -54,7 +54,10 @@ pub const SqliteStore = struct {
         // consumed_at marks an outbox result as picked up (consumed) by a
         // reader. NULL means the result is still waiting to be consumed.
         // Keeps with the v0 philosophy: nullability is the state.
-        addColumnIfMissing(db, "tasks", "consumed_at", "TEXT DEFAULT NULL") catch {};
+        // consumed_at is load-bearing for the retention feature — propagate
+        // a migration failure instead of swallowing it (every readOutbox/ack/
+        // purge query would otherwise fail with a confusing SQL error later).
+        try addColumnIfMissing(db, "tasks", "consumed_at", "TEXT DEFAULT NULL");
         // Archive table — retired rows (consumed, or aged-out unconsumed) are
         // moved here by purge(). Kept forever; queried by the admin archive view.
         // Same shape as tasks so INSERT ... SELECT ... moves rows verbatim,
@@ -201,12 +204,18 @@ pub const SqliteStore = struct {
         return self.db.changes() > 0;
     }
 
+    /// Read the agent's unconsumed results completed strictly after
+    /// `since_timestamp`. The comparison is lexicographic on purpose: both
+    /// stored `completed_at` and the cursor come from the same fixed-width
+    /// `%Y-%m-%d %H:%M:%f` format, so text comparison is exact — including
+    /// milliseconds. `datetime()` would truncate to whole seconds and lose
+    /// same-second results published just after the cursor.
     pub fn readOutbox(self: *SqliteStore, allocator: std.mem.Allocator, tenant_id: []const u8, agent_id: []const u8, since_timestamp: []const u8) ![]types.OutboxResult {
         const sql =
             \\SELECT task_id, action, payload, output, completed_at, workstream_id, consumed_at
             \\FROM tasks
             \\WHERE tenant_id = ? AND agent_id = ? AND output IS NOT NULL AND consumed_at IS NULL
-            \\  AND datetime(completed_at) > datetime(?)
+            \\  AND completed_at > ?
             \\ORDER BY completed_at ASC;
         ;
         var stmt = try self.db.prepare(sql);
@@ -262,27 +271,28 @@ pub const SqliteStore = struct {
             \\        AND datetime(completed_at) <= datetime('now', '-90 days'))
             \\  );
         );
-        // Step 2: remove the retired rows from the hot table.
+        // Step 2: remove the archived rows from the hot table. Archive
+        // membership alone decides — anything already copied to tasks_archive
+        // must leave tasks, no matter what happened to it since (a crash
+        // between the two statements, or a late ack after the copy, must not
+        // strand a row in the hot table until its grace window expires).
         try self.db.exec(
-            \\DELETE FROM tasks
-            \\WHERE task_id IN (SELECT task_id FROM tasks_archive)
-            \\  AND output IS NOT NULL
-            \\  AND (
-            \\       (consumed_at IS NOT NULL AND datetime(consumed_at) <= datetime('now', '-1 hours'))
-            \\    OR (consumed_at IS NULL AND completed_at IS NOT NULL
-            \\        AND datetime(completed_at) <= datetime('now', '-90 days'))
-            \\  );
+            \\DELETE FROM tasks WHERE task_id IN (SELECT task_id FROM tasks_archive);
         );
     }
 
     /// Acknowledge (consume) a single outbox result. The row stays in the hot
     /// table until the next purge pass retires it to the archive.
+    /// Idempotent: re-acking an already-consumed result matches the row
+    /// (COALESCE leaves consumed_at untouched) and returns true / HTTP 200,
+    /// matching the documented client contract. A genuinely missing task or
+    /// a pending inbox task (no output yet) matches nothing → false / 404.
     pub fn ack(self: *SqliteStore, tenant_id: []const u8, agent_id: []const u8, task_id: []const u8) !bool {
         const sql =
             \\UPDATE tasks
-            \\SET consumed_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
+            \\SET consumed_at = COALESCE(consumed_at, strftime('%Y-%m-%d %H:%M:%f', 'now'))
             \\WHERE tenant_id = ? AND agent_id = ? AND task_id = ?
-            \\  AND output IS NOT NULL AND consumed_at IS NULL;
+            \\  AND output IS NOT NULL;
         ;
         var stmt = try self.db.prepare(sql);
         defer stmt.finalize();
@@ -298,13 +308,17 @@ pub const SqliteStore = struct {
     /// Also retires anything already retired-eligible immediately so consumers
     /// see the effect of their ack without waiting for the next purge pass.
     pub fn ackAll(self: *SqliteStore, tenant_id: []const u8, agent_id: []const u8, before_timestamp: []const u8) !types.AckResult {
+        // Snapshot the agent's archive size before the sweep so the `archived`
+        // count reports exactly what *this* call retired (no time-window
+        // heuristics that concurrent dispatch/claim-triggered purges would skew).
+        const before_count = try self.countArchive(agent_id);
         {
             const sql =
                 \\UPDATE tasks
                 \\SET consumed_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
                 \\WHERE tenant_id = ? AND agent_id = ?
                 \\  AND output IS NOT NULL AND consumed_at IS NULL
-                \\  AND datetime(completed_at) <= datetime(?);
+                \\  AND completed_at <= ?;
             ;
             var stmt = try self.db.prepare(sql);
             defer stmt.finalize();
@@ -317,19 +331,18 @@ pub const SqliteStore = struct {
         // Retire-eligible rows (consumed_at older than the grace window, or
         // unconsumed but past the safety-net retention) are archived right away.
         try self.purge();
-        // Count what just moved to the archive for this agent.
-        var archived: i64 = 0;
-        {
-            const sql =
-                \\SELECT COUNT(*) FROM tasks_archive WHERE agent_id = ?
-                \\  AND datetime(archived_at) >= datetime('now', '-5 seconds');
-            ;
-            var stmt = try self.db.prepare(sql);
-            defer stmt.finalize();
-            try stmt.bindText(1, agent_id);
-            if (try stmt.step()) archived = stmt.columnInt(0);
-        }
+        const archived = try self.countArchive(agent_id) - before_count;
         return .{ .acked = acked, .archived = archived };
+    }
+
+    /// Count this agent's archived rows.
+    fn countArchive(self: *SqliteStore, agent_id: []const u8) !i64 {
+        const sql = "SELECT COUNT(*) FROM tasks_archive WHERE agent_id = ?";
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+        try stmt.bindText(1, agent_id);
+        if (try stmt.step()) return stmt.columnInt(0);
+        return 0;
     }
 
     /// List archived (retired) outbox tasks, newest first (admin).
@@ -711,8 +724,9 @@ test "ack lifecycle: result stays in outbox until acked, then leaves reads" {
         try std.testing.expectEqual(@as(usize, 0), outbox.len);
     }
 
-    // Double-ack is a no-op (row already consumed → false, idempotent).
-    try std.testing.expect(!(try ts.ack("team-1", "billing-agent", "task-301")));
+    // Re-acking an already-consumed result is idempotent: 200, consumed_at
+    // unchanged (COALESCE), per the documented client contract.
+    try std.testing.expect(try ts.ack("team-1", "billing-agent", "task-301"));
 
     // A pending inbox task cannot be acked (no output yet).
     try ts.dispatch("team-1", "billing-agent", "task-302", "process", "{}", null);
@@ -896,4 +910,66 @@ test "readOutbox since-cursor filters by completed_at" {
         try std.testing.expectEqual(@as(usize, 1), archive.len);
         try std.testing.expectEqualStrings("task-601", archive[0].task_id);
     }
+}
+
+test "ack preserves the original consumed_at on re-ack" {
+    const allocator = std.testing.allocator;
+    var s = try SqliteStore.init(allocator, ":memory:");
+    defer s.deinit();
+    const ts = s.storeInterface();
+
+    try ts.dispatch("team-1", "billing-agent", "task-701", "process", "{}", null);
+    {
+        const c = (try ts.claim(allocator, "team-1", "billing-agent")) orelse return error.ClaimFailed;
+        defer c.deinit(allocator);
+    }
+    try std.testing.expect(try ts.complete("team-1", "billing-agent", "task-701", "{\"ok\":true}"));
+    try std.testing.expect(try ts.ack("team-1", "billing-agent", "task-701"));
+
+    // Capture the consumed_at from the first ack.
+    var first: []u8 = "";
+    defer if (first.len > 0) allocator.free(first);
+    {
+        var stmt = try s.db.prepare("SELECT consumed_at FROM tasks WHERE task_id = 'task-701'");
+        defer stmt.finalize();
+        if (try stmt.step()) first = try allocator.dupe(u8, stmt.columnText(0));
+    }
+
+    // Re-ack returns true and must NOT bump consumed_at (COALESCE keeps it).
+    try std.testing.expect(try ts.ack("team-1", "billing-agent", "task-701"));
+    {
+        var stmt = try s.db.prepare("SELECT consumed_at FROM tasks WHERE task_id = 'task-701'");
+        defer stmt.finalize();
+        if (try stmt.step()) try std.testing.expectEqualStrings(first, stmt.columnText(0));
+    }
+}
+
+test "since-cursor is millisecond-exact (same-second results)" {
+    const allocator = std.testing.allocator;
+    var s = try SqliteStore.init(allocator, ":memory:");
+    defer s.deinit();
+    const ts = s.storeInterface();
+
+    // Two results completed within the SAME second, with distinct millis.
+    inline for (.{ "task-801", "task-802" }) |tid| {
+        try ts.dispatch("team-1", "billing-agent", tid, "process", "{}", null);
+        const c = (try ts.claim(allocator, "team-1", "billing-agent")) orelse return error.ClaimFailed;
+        defer c.deinit(allocator);
+        try std.testing.expect(try ts.complete("team-1", "billing-agent", tid, "{\"ok\":true}"));
+    }
+    // Force identical whole seconds with different fractional parts.
+    {
+        var stmt = try s.db.prepare(
+            "UPDATE tasks SET completed_at = CASE task_id WHEN 'task-801' THEN '2020-01-01 10:00:00.123' ELSE '2020-01-01 10:00:00.456' END WHERE task_id IN ('task-801','task-802')",
+        );
+        defer stmt.finalize();
+        _ = try stmt.step();
+    }
+
+    // A consumer holding the cursor 10:00:00.123 must still see the .456 result.
+    // (datetime() truncation would make both sides equal → the row would be lost.)
+    const outbox = try ts.readOutbox(allocator, "team-1", "billing-agent", "2020-01-01 10:00:00.123");
+    defer { for (outbox) |o| o.deinit(allocator); allocator.free(outbox); }
+    try std.testing.expectEqual(@as(usize, 1), outbox.len);
+    try std.testing.expectEqualStrings("task-802", outbox[0].task_id);
 }

@@ -63,23 +63,31 @@ fn claimUrl(self: *BoxClient, allocator: std.mem.Allocator) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/v1/agents/{s}/inbox/claim", .{ self.base_url, self.agent_id });
 }
 
+/// Percent-encode spaces in a query value into `buf` (' ' → "%20"). This is
+/// not a general URL encoder — it covers exactly what cursors need (server-
+/// generated `YYYY-MM-DD HH:MM:SS.fff` timestamps). Returns the written slice
+/// or error.CursorTooLong when the encoded form exceeds `buf`.
+fn encodeQueryValue(buf: *[64]u8, value: []const u8) ![]const u8 {
+    var n: usize = 0;
+    for (value) |c| {
+        if (c == ' ') {
+            if (n + 3 > buf.len) return error.CursorTooLong;
+            @memcpy(buf[n .. n + 3], "%20");
+            n += 3;
+        } else {
+            if (n + 1 > buf.len) return error.CursorTooLong;
+            buf[n] = c;
+            n += 1;
+        }
+    }
+    return buf[0..n];
+}
+
 fn readOutboxUrl(self: *BoxClient, allocator: std.mem.Allocator, since: ?[]const u8) ![]const u8 {
     if (since) |s| {
-        // Percent-encode the cursor: timestamps contain spaces ('%20').
-        var enc: [64]u8 = undefined;
-        var n: usize = 0;
-        for (s) |c| {
-            if (c == ' ') {
-                if (n + 3 > enc.len) return error.CursorTooLong;
-                @memcpy(enc[n .. n + 3], "%20");
-                n += 3;
-            } else {
-                if (n + 1 > enc.len) return error.CursorTooLong;
-                enc[n] = c;
-                n += 1;
-            }
-        }
-        return std.fmt.allocPrint(allocator, "{s}/v1/agents/{s}/outbox?since={s}", .{ self.base_url, self.agent_id, enc[0..n] });
+        var buf: [64]u8 = undefined;
+        const enc = try encodeQueryValue(&buf, s);
+        return std.fmt.allocPrint(allocator, "{s}/v1/agents/{s}/outbox?since={s}", .{ self.base_url, self.agent_id, enc });
     }
     return std.fmt.allocPrint(allocator, "{s}/v1/agents/{s}/outbox", .{ self.base_url, self.agent_id });
 }
@@ -102,21 +110,9 @@ fn ackUrl(self: *BoxClient, allocator: std.mem.Allocator, task_id: []const u8) !
 
 fn ackAllUrl(self: *BoxClient, allocator: std.mem.Allocator, before: ?[]const u8) ![]const u8 {
     if (before) |b| {
-        // Percent-encode the bound: timestamps contain spaces ('%20').
-        var enc: [64]u8 = undefined;
-        var n: usize = 0;
-        for (b) |c| {
-            if (c == ' ') {
-                if (n + 3 > enc.len) return error.CursorTooLong;
-                @memcpy(enc[n .. n + 3], "%20");
-                n += 3;
-            } else {
-                if (n + 1 > enc.len) return error.CursorTooLong;
-                enc[n] = c;
-                n += 1;
-            }
-        }
-        return std.fmt.allocPrint(allocator, "{s}/v1/agents/{s}/outbox/ack-all?before={s}", .{ self.base_url, self.agent_id, enc[0..n] });
+        var buf: [64]u8 = undefined;
+        const enc = try encodeQueryValue(&buf, b);
+        return std.fmt.allocPrint(allocator, "{s}/v1/agents/{s}/outbox/ack-all?before={s}", .{ self.base_url, self.agent_id, enc });
     }
     return std.fmt.allocPrint(allocator, "{s}/v1/agents/{s}/outbox/ack-all", .{ self.base_url, self.agent_id });
 }

@@ -287,10 +287,14 @@ fn handleReadOutbox(self: *Server, req: *http.Server.Request, agent_id: []const 
     // Honor the ?since=<timestamp> cursor: only results completed after the
     // given timestamp are returned. Consumers pass the newest completed_at
     // they have seen to avoid re-downloading the entire outbox each poll.
-    // Missing/invalid ?since falls back to the epoch (all unconsumed results).
+    // Missing or empty ?since falls back to the epoch (all unconsumed results)
+    // so a bare `?since=` cannot silently filter everything out.
     const since_owned = queryParamDup(a, req.head_buffer, "since");
     defer if (since_owned) |s| a.free(s);
-    const since: []const u8 = since_owned orelse "1970-01-01 00:00:00";
+    var since: []const u8 = "1970-01-01 00:00:00";
+    if (since_owned) |s| {
+        if (s.len > 0) since = s;
+    }
     const results = self.store.readOutbox(a, "default-team", agent_id, since) catch |err| {
         return errJson(a, req, .internal_server_error, @errorName(err));
     };
@@ -375,11 +379,15 @@ fn queryParam(head_buffer: []const u8, key: []const u8) ?[]const u8 {
 /// decode-count-then-fill), so `allocator.free` on it is valid.
 fn queryParamDup(a: std.mem.Allocator, head_buffer: []const u8, key: []const u8) ?[]const u8 {
     const raw = queryParam(head_buffer, key) orelse return null;
-    // Pass 1: count the decoded length.
+    // Two-pass decode (count, then fill): decoding never expands (%XX → 1
+    // byte, '+' → 1 byte), so pass 1 yields the exact output length and pass 2
+    // allocates exactly that — Zig's allocator.free requires the returned
+    // slice's length to match the allocation, so a realloc-based shrink is
+    // not portable here (realloc must receive the full-length slice).
     var n: usize = 0;
     var i: usize = 0;
     while (i < raw.len) {
-        if (raw[i] == '%' and i + 2 < raw.len + 1 and i + 3 <= raw.len) {
+        if (raw[i] == '%' and i + 3 <= raw.len) {
             if (std.fmt.charToDigit(raw[i + 1], 16) catch null) |_| {
                 if (std.fmt.charToDigit(raw[i + 2], 16) catch null) |_| {
                     n += 1;
@@ -391,7 +399,6 @@ fn queryParamDup(a: std.mem.Allocator, head_buffer: []const u8, key: []const u8)
         n += 1;
         i += 1;
     }
-    // Pass 2: fill exactly n bytes.
     const out = a.alloc(u8, n) catch return null;
     var o: usize = 0;
     i = 0;
@@ -400,7 +407,7 @@ fn queryParamDup(a: std.mem.Allocator, head_buffer: []const u8, key: []const u8)
             out[o] = ' ';
             o += 1;
             i += 1;
-        } else if (raw[i] == '%' and i + 2 < raw.len + 1 and i + 3 <= raw.len) {
+        } else if (raw[i] == '%' and i + 3 <= raw.len) {
             if (std.fmt.charToDigit(raw[i + 1], 16) catch null) |hi| {
                 if (std.fmt.charToDigit(raw[i + 2], 16) catch null) |lo| {
                     out[o] = @intCast(hi * 16 + lo);

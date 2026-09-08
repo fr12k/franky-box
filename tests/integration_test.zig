@@ -635,10 +635,11 @@ test "ack removes a result from the outbox read" {
         try testing.expect(std.mem.indexOf(u8, outbox.body, task_id) == null);
     }
 
-    // Re-acking an already-consumed result is a no-op (404 not-found is fine
-    // to ignore; the row stays consumed either way).
+    // Re-acking an already-consumed result is idempotent: HTTP 200 with the
+    // original consumed_at preserved (COALESCE), per the documented contract.
     var ack_resp2 = try ctx.requestWithAuth(.POST, ack_path, "", "Bearer default-secret-please-change");
     defer ack_resp2.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), ack_resp2.status_code);
 
     // The consumed result remains visible to the admin outbox view until
     // it is retired to the archive.

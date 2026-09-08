@@ -38,7 +38,13 @@ GET  /v1/agents/:agent_id/outbox?since=<ts>        cursor-based poll
 
 - `readOutbox` only returns **unconsumed** results and honors the `?since=`
   cursor (percent-encoded timestamps work, e.g. `since=2026-09-08%2000:00:00`).
-- Acking is idempotent: acking an already-consumed result is a no-op.
+- Acking is idempotent: acking an already-consumed result keeps its original
+  `consumed_at` (COALESCE) and returns 200; a missing task or a pending inbox
+  task returns 404.
+- The `?since=` cursor comparison is lexicographic on purpose: both stored
+  `completed_at` and cursors use the same fixed-width `%Y-%m-%d %H:%M:%f`
+  format, so text comparison is exact to the millisecond (`datetime()` would
+  truncate to whole seconds and lose same-second results).
 - Failed results (poison pills, explicit `fail()`) follow the same lifecycle.
 - The admin UI (`/admin/outbox`) shows the consumed state; `/admin/archive`
   lists retired tasks.

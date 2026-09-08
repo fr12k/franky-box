@@ -115,7 +115,9 @@ Retention is two-trigger, driven by consumption rather than age alone:
 INSERT OR IGNORE INTO tasks_archive (...) SELECT ... FROM tasks WHERE output IS NOT NULL AND (
      (consumed_at IS NOT NULL AND datetime(consumed_at) <= datetime('now', '-1 hours'))
   OR (consumed_at IS NULL AND datetime(completed_at) <= datetime('now', '-90 days')));
-DELETE FROM tasks WHERE task_id IN (SELECT task_id FROM tasks_archive) AND (same predicate);
+DELETE FROM tasks WHERE task_id IN (SELECT task_id FROM tasks_archive);
+-- Archive membership alone decides: a row copied to the archive always leaves
+-- the hot table, even after a crash between the two statements or a late ack.
 
 The same-file archive table keeps the move atomic in one transaction. If a
 separate archive FILE is ever wanted (independent backup/rotation), the move
