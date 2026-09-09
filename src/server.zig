@@ -168,7 +168,7 @@ pub fn handleWithPath(self: *Server, req: *http.Server.Request, path_with_query:
         if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
         try req.respond(htmx_js, .{ .extra_headers = &.{
             .{ .name = "content-type", .value = "application/javascript; charset=utf-8" },
-            .{ .name = "cache-control", .value = "public, max-age=86400, immutable" },
+            .{ .name = "cache-control", .value = "public, max-age=86400" },
         } });
         return;
     }
@@ -218,13 +218,6 @@ pub fn handleWithPath(self: *Server, req: *http.Server.Request, path_with_query:
     if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "dispatch")) {
         if (method != .POST) return errJson(a, req, .method_not_allowed, "method not allowed");
         return self.handleAdminDispatch(req, body);
-    }
-
-    // Admin register-agent: form-encoded input, HTML-fragment output (the
-    // refreshed agents <tbody> so htmx swaps it in place).
-    if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "register-agent")) {
-        if (method != .POST) return errJson(a, req, .method_not_allowed, "method not allowed");
-        return self.handleAdminRegisterAgent(req);
     }
 
     return errJson(a, req, .not_found, "route not found");
@@ -513,6 +506,20 @@ fn htmlError(a: std.mem.Allocator, req: *http.Server.Request, status: http.Statu
     } });
 }
 
+/// Like htmlError, but emits a disabled <option> instead of a <div> toast.
+/// Used by handlers whose response is swapped into a <select> (where a <div>
+/// would be invalid HTML and not render).
+fn htmlOptionError(a: std.mem.Allocator, req: *http.Server.Request, status: http.Status, msg: []const u8) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.appendSlice(a, "<option value=\"\" disabled>");
+    try htmlEscape(&buf, a, msg);
+    try buf.appendSlice(a, "</option>");
+    try req.respond(buf.items, .{ .status = status, .extra_headers = &.{
+        .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+    } });
+}
+
 /// Extract a field from an `application/x-www-form-urlencoded` body.
 /// URL-decodes the value. Returns a caller-owned slice (allocator), or null if
 /// the field is absent. Replaces `extractJsonField`+`stripJsonString` for the
@@ -524,7 +531,10 @@ fn formField(body: []const u8, key: []const u8, allocator: std.mem.Allocator) ?[
         const eq = mem.indexOfScalar(u8, pair, '=') orelse continue;
         if (!mem.eql(u8, pair[0..eq], key)) continue;
         const enc = pair[eq + 1 ..];
-        // URL-decode (%XX and +).
+        // URL-decode (%XX and +). An empty decoded value counts as absent
+        // (returns null) so callers can treat `workstream_id=` (the placeholder
+        // <option>) and a missing field identically — no per-call empty-string
+        // guards needed.
         const out = allocator.alloc(u8, enc.len) catch return null;
         var oi: usize = 0;
         var i: usize = 0;
@@ -551,7 +561,16 @@ fn formField(body: []const u8, key: []const u8, allocator: std.mem.Allocator) ?[
                 oi += 1;
             }
         }
-        return allocator.realloc(out, oi) catch out[0..oi];
+        if (oi == 0) {
+            allocator.free(out);
+            return null;
+        }
+        // On realloc failure, free the original and report absence rather than
+        // returning a slice into a possibly-invalidated allocation.
+        return allocator.realloc(out, oi) catch {
+            allocator.free(out);
+            return null;
+        };
     }
     return null;
 }
@@ -760,28 +779,9 @@ fn handleAdminWorkstreamOptions(self: *Server, req: *http.Server.Request) !void 
     const a = self.allocator;
     // Errors are emitted as <option> elements (not a <div> toast) because htmx
     // swaps this response into a <select>; a <div> inside a <select> is invalid
-    // HTML and would not render. A disabled option with the error message is the
-    // correct fallback for the select context.
-    if (!requireAdmin(req)) {
-        var eb: std.ArrayList(u8) = .empty;
-        defer eb.deinit(a);
-        try eb.appendSlice(a, "<option value=\"\" disabled>unauthorized</option>");
-        try req.respond(eb.items, .{ .status = .unauthorized, .extra_headers = &.{
-            .{ .name = "content-type", .value = "text/html; charset=utf-8" },
-        } });
-        return;
-    }
-    const streams = self.store.fetchWorkstreams(a) catch |err| {
-        var eb: std.ArrayList(u8) = .empty;
-        defer eb.deinit(a);
-        try eb.appendSlice(a, "<option value=\"\" disabled>");
-        try htmlEscape(&eb, a, @errorName(err));
-        try eb.appendSlice(a, "</option>");
-        try req.respond(eb.items, .{ .status = .internal_server_error, .extra_headers = &.{
-            .{ .name = "content-type", .value = "text/html; charset=utf-8" },
-        } });
-        return;
-    };
+    // HTML and would not render. htmlOptionError handles this.
+    if (!requireAdmin(req)) return htmlOptionError(a, req, .unauthorized, "unauthorized");
+    const streams = self.store.fetchWorkstreams(a) catch |err| return htmlOptionError(a, req, .internal_server_error, @errorName(err));
     defer { for (streams) |s| s.deinit(a); a.free(streams); }
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
@@ -814,7 +814,8 @@ fn handleAdminDispatch(self: *Server, req: *http.Server.Request, body: []const u
     //   1. workstream_id given  → must already exist (lookup), else 400.
     //   2. workstream_name given → lookup by name; if found join, if not create + join.
     //   3. neither given         → generate a fresh workstream UUID (no name row).
-    // Empty strings (e.g. the "— none —" placeholder option) count as not-given.
+    // formField returns null for absent OR empty values, so the placeholder
+    // <option value=""> the browser always submits is treated as not-given.
     const ws_id = formField(body, "workstream_id", a);
     defer if (ws_id) |w| a.free(w);
     const ws_name = formField(body, "workstream_name", a);
@@ -829,50 +830,36 @@ fn handleAdminDispatch(self: *Server, req: *http.Server.Request, body: []const u
 
     // Resolve the workstream id per the three modes above.
     // `owned_ws` owns any id we allocate (lookup dupe or new UUID); freed at end.
-    // Empty strings (e.g. the "— none —" placeholder option the browser always
-    // submits for the workstream_id <select>) count as not-given: we fall through
-    // to the next mode instead of breaking out of the block, so a typed
-    // workstream_name is not silently discarded when the select is on "none".
     var owned_ws: ?[]u8 = null;
     defer if (owned_ws) |w| a.free(w);
-    const ws: ?[]const u8 = blk: {
+    const ws: []const u8 = blk: {
         if (ws_id) |id| {
-            if (id.len > 0) {
-                // Mode 1: explicit id — must exist.
-                const found = try self.store.lookupWorkstreamById(a, id);
-                if (found) |fid| { owned_ws = fid; break :blk fid; }
-                return htmlError(a, req, .bad_request, "workstream_id not found");
-            }
-            // empty workstream_id → fall through to name check (mode 2).
+            // Mode 1: explicit id — must exist.
+            const found = try self.store.lookupWorkstreamById(a, id);
+            if (found) |fid| { owned_ws = fid; break :blk fid; }
+            return htmlError(a, req, .bad_request, "workstream_id not found");
         }
         if (ws_name) |name| {
             if (name.len > 256) return htmlError(a, req, .bad_request, "workstream_name exceeds 256 characters");
-            if (name.len > 0) {
-                // Mode 2: name — lookup, then create-or-join.
-                const found = try self.store.lookupWorkstreamByName(a, name);
-                if (found) |fid| { owned_ws = fid; break :blk fid; }
-                // Not found — create it. A duplicate name (race or deliberate) → 409.
-                const new_id = try uuid.newWorkstreamId(self.io, a);
-                owned_ws = new_id;
-                self.store.createWorkstream(new_id, name) catch |err| {
-                    if (err == error.DuplicateWorkstreamName) return htmlError(a, req, .conflict, "workstream name already exists");
-                    return htmlError(a, req, .internal_server_error, @errorName(err));
-                };
-                break :blk new_id;
-            }
-            // empty workstream_name → fall through to mode 3.
+            // Mode 2: name — lookup, then create-or-join.
+            const found = try self.store.lookupWorkstreamByName(a, name);
+            if (found) |fid| { owned_ws = fid; break :blk fid; }
+            // Not found — create it. A duplicate name (race or deliberate) → 409.
+            const new_id = try uuid.newWorkstreamId(self.io, a);
+            owned_ws = new_id;
+            self.store.createWorkstream(new_id, name) catch |err| {
+                if (err == error.DuplicateWorkstreamName) return htmlError(a, req, .conflict, "workstream name already exists");
+                return htmlError(a, req, .internal_server_error, @errorName(err));
+            };
+            break :blk new_id;
         }
-        // Mode 3: neither given (or both empty) — null here; anonymous id generated below.
-        break :blk null;
-    };
-    // If all three modes fell through to null, generate the anonymous id now.
-    const ws_final: []const u8 = if (ws) |w| w else blk: {
+        // Mode 3: neither given — generate a fresh anonymous workstream id (w_ + UUID).
         const new_id = try uuid.newWorkstreamId(self.io, a);
         owned_ws = new_id;
         break :blk new_id;
     };
 
-    self.store.dispatch("default-team", agent_id, task_id, action, payload_raw, ws_final) catch |err| {
+    self.store.dispatch("default-team", agent_id, task_id, action, payload_raw, ws) catch |err| {
         return htmlError(a, req, .internal_server_error, @errorName(err));
     };
     // Respond with an HTML toast fragment; htmx swaps it into #dispatchResult.
@@ -881,35 +868,11 @@ fn handleAdminDispatch(self: *Server, req: *http.Server.Request, body: []const u
     try buf.appendSlice(a, "<div class=\"toast success\">✅ Task dispatched: <code>");
     try htmlEscape(&buf, a, task_id);
     try buf.appendSlice(a, "</code><br>workstream: <code>");
-    try htmlEscape(&buf, a, ws_final);
+    try htmlEscape(&buf, a, ws);
     try buf.appendSlice(a, "</code></div>");
     try htmlResp(req, buf.items);
 }
 
-fn handleAdminRegisterAgent(self: *Server, req: *http.Server.Request) !void {
-    if (!requireAdmin(req)) return htmlError(self.allocator, req, .unauthorized, "unauthorized");
-    const a = self.allocator;
-    var buf: [32]u8 = undefined;
-    self.io.random(&buf);
-    const secret = try fmt.allocPrint(a, "{s}", .{fmt.bytesToHex(&buf, .lower)});
-    defer a.free(secret);
-    const agent_id = try fmt.allocPrint(a, "agent-{d}", .{self.agents.count()});
-    errdefer a.free(agent_id);
-    try self.agents.put(agent_id, try a.dupe(u8, secret));
-    // Respond with the refreshed agents <tbody> so htmx swaps it in place of
-    // the old #agents-table tbody (hx-target="#agents-table tbody").
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(a);
-    var it = self.agents.iterator();
-    while (it.next()) |entry| {
-        try out.appendSlice(a, "<tr><td data-label=\"Agent ID\">");
-        try htmlEscape(&out, a, entry.key_ptr.*);
-        try out.appendSlice(a, "</td><td data-label=\"Secret\"><code>");
-        try htmlEscape(&out, a, entry.value_ptr.*);
-        try out.appendSlice(a, "</code></td></tr>");
-    }
-    try htmlResp(req, out.items);
-}
 
 /// Emit a properly-escaped JSON string (opening + closing quotes, escaped contents).
 /// Used for all string values in JSON responses to prevent injection of `"`, `\`,
