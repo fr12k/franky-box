@@ -571,9 +571,39 @@ test "anonymous workstream id can be joined by id" {
     try testing.expectEqualStrings(ws, follow_ws);
 }
 
+test "admin dispatch with empty workstream_id falls through to workstream_name" {
+    // Regression: the browser <select name="workstream_id"> always submits,
+    // with value="" for the placeholder. An empty workstream_id must NOT
+    // short-circuit the workstream-name mode; otherwise a typed name is
+    // silently discarded and an anonymous workstream is generated instead.
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    const body = try formBody(testing.allocator, &.{
+        .{ .key = "agent_id", .val = "agent-0" },
+        .{ .key = "action", .val = "x" },
+        .{ .key = "payload", .val = "{}" },
+        .{ .key = "workstream_id", .val = "" }, // empty, as the placeholder submits
+        .{ .key = "workstream_name", .val = "Fallback Name" },
+    });
+    defer testing.allocator.free(body);
+    var resp = try ctx.requestWithAuth(.POST, "/admin/dispatch", body, "Bearer admin-token-change-me");
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), resp.status_code);
+    const ws = extractAdminWorkstreamId(resp.body) orelse return error.MissingWs;
+    defer testing.allocator.free(ws);
+
+    // The workstream must have been created by name, so it appears in the list
+    // with the name "Fallback Name" (an anonymous workstream would have no row).
+    var list = try ctx.requestWithAuth(.GET, "/admin/workstreams", "", "Bearer admin-token-change-me");
+    defer list.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), list.status_code);
+    try testing.expect(std.mem.indexOf(u8, list.body, ws) != null);
+    try testing.expect(std.mem.indexOf(u8, list.body, "Fallback Name") != null);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 /// Extract a string JSON field value by key from a response body.
 /// Returns a caller-owned slice (allocated via `testing.allocator`), or null

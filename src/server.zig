@@ -757,16 +757,36 @@ fn handleAdminDispatchForm(self: *Server, req: *http.Server.Request) !void {
 /// <option> fragment for the dispatch form's workstream <select>.
 /// htmx swaps these into the <select> on load (hx-trigger="load").
 fn handleAdminWorkstreamOptions(self: *Server, req: *http.Server.Request) !void {
-    if (!requireAdmin(req)) return htmlError(self.allocator, req, .unauthorized, "unauthorized");
     const a = self.allocator;
-    const streams = self.store.fetchWorkstreams(a) catch |err| return htmlError(a, req, .internal_server_error, @errorName(err));
+    // Errors are emitted as <option> elements (not a <div> toast) because htmx
+    // swaps this response into a <select>; a <div> inside a <select> is invalid
+    // HTML and would not render. A disabled option with the error message is the
+    // correct fallback for the select context.
+    if (!requireAdmin(req)) {
+        var eb: std.ArrayList(u8) = .empty;
+        defer eb.deinit(a);
+        try eb.appendSlice(a, "<option value=\"\" disabled>unauthorized</option>");
+        try req.respond(eb.items, .{ .status = .unauthorized, .extra_headers = &.{
+            .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+        } });
+        return;
+    }
+    const streams = self.store.fetchWorkstreams(a) catch |err| {
+        var eb: std.ArrayList(u8) = .empty;
+        defer eb.deinit(a);
+        try eb.appendSlice(a, "<option value=\"\" disabled>");
+        try htmlEscape(&eb, a, @errorName(err));
+        try eb.appendSlice(a, "</option>");
+        try req.respond(eb.items, .{ .status = .internal_server_error, .extra_headers = &.{
+            .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+        } });
+        return;
+    };
     defer { for (streams) |s| s.deinit(a); a.free(streams); }
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
-    // htmx swaps into the <select>; the leading option is kept (it is not
-    // replaced because hx-swap="innerHTML" replaces the children, and the
-    // existing placeholder option is part of the children). To keep the
-    // placeholder, we re-emit it first.
+    // htmx swaps into the <select> (hx-swap="innerHTML"), replacing all children.
+    // Re-emit the placeholder first so the "— none —" option survives the swap.
     try buf.appendSlice(a, "<option value=\"\">— none (create new below) —</option>");
     for (streams) |s| {
         try buf.appendSlice(a, "<option value=\"");
@@ -809,35 +829,40 @@ fn handleAdminDispatch(self: *Server, req: *http.Server.Request, body: []const u
 
     // Resolve the workstream id per the three modes above.
     // `owned_ws` owns any id we allocate (lookup dupe or new UUID); freed at end.
-    // `ws` is null only when the user explicitly left both workstream fields empty
-    // (mode 3) AND we fell through the empty-string short-circuits above — in that
-    // case we generate a fresh anonymous id here so dispatch always gets a value.
+    // Empty strings (e.g. the "— none —" placeholder option the browser always
+    // submits for the workstream_id <select>) count as not-given: we fall through
+    // to the next mode instead of breaking out of the block, so a typed
+    // workstream_name is not silently discarded when the select is on "none".
     var owned_ws: ?[]u8 = null;
     defer if (owned_ws) |w| a.free(w);
     const ws: ?[]const u8 = blk: {
         if (ws_id) |id| {
-            if (id.len == 0) break :blk null;
-            // Mode 1: explicit id — must exist.
-            const found = try self.store.lookupWorkstreamById(a, id);
-            if (found) |fid| { owned_ws = fid; break :blk fid; }
-            return htmlError(a, req, .bad_request, "workstream_id not found");
+            if (id.len > 0) {
+                // Mode 1: explicit id — must exist.
+                const found = try self.store.lookupWorkstreamById(a, id);
+                if (found) |fid| { owned_ws = fid; break :blk fid; }
+                return htmlError(a, req, .bad_request, "workstream_id not found");
+            }
+            // empty workstream_id → fall through to name check (mode 2).
         }
         if (ws_name) |name| {
             if (name.len > 256) return htmlError(a, req, .bad_request, "workstream_name exceeds 256 characters");
-            if (name.len == 0) break :blk null;
-            // Mode 2: name — lookup, then create-or-join.
-            const found = try self.store.lookupWorkstreamByName(a, name);
-            if (found) |fid| { owned_ws = fid; break :blk fid; }
-            // Not found — create it. A duplicate name (race or deliberate) → 409.
-            const new_id = try uuid.newWorkstreamId(self.io, a);
-            owned_ws = new_id;
-            self.store.createWorkstream(new_id, name) catch |err| {
-                if (err == error.DuplicateWorkstreamName) return htmlError(a, req, .conflict, "workstream name already exists");
-                return htmlError(a, req, .internal_server_error, @errorName(err));
-            };
-            break :blk new_id;
+            if (name.len > 0) {
+                // Mode 2: name — lookup, then create-or-join.
+                const found = try self.store.lookupWorkstreamByName(a, name);
+                if (found) |fid| { owned_ws = fid; break :blk fid; }
+                // Not found — create it. A duplicate name (race or deliberate) → 409.
+                const new_id = try uuid.newWorkstreamId(self.io, a);
+                owned_ws = new_id;
+                self.store.createWorkstream(new_id, name) catch |err| {
+                    if (err == error.DuplicateWorkstreamName) return htmlError(a, req, .conflict, "workstream name already exists");
+                    return htmlError(a, req, .internal_server_error, @errorName(err));
+                };
+                break :blk new_id;
+            }
+            // empty workstream_name → fall through to mode 3.
         }
-        // Mode 3: neither given — generate a fresh anonymous workstream id (w_ + UUID).
+        // Mode 3: neither given (or both empty) — null here; anonymous id generated below.
         break :blk null;
     };
     // If all three modes fell through to null, generate the anonymous id now.
