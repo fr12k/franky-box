@@ -153,9 +153,24 @@ pub fn handleWithPath(self: *Server, req: *http.Server.Request, path_with_query:
     }
 
     // --- Admin UI routes ---
+    // The admin UI is an htmx 4 single-page shell (GET /admin) whose nav
+    // links issue hx-get to the fragment endpoints below. Fragment endpoints
+    // return HTML (text/html), not JSON; only /admin/api stays JSON (used by
+    // `franky-box update --check`). See HTMX_ADMIN_RFC.md.
     if (segments.len == 1 and isSeg(segments[0], "admin")) {
         if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
         return self.handleAdminPage(req);
+    }
+
+    // Vendored htmx 4 library (served as application/javascript so the browser
+    // can execute it; embedded at compile time, no CDN/runtime dependency).
+    if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "htmx.min.js")) {
+        if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
+        try req.respond(htmx_js, .{ .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/javascript; charset=utf-8" },
+            .{ .name = "cache-control", .value = "public, max-age=86400, immutable" },
+        } });
+        return;
     }
 
     if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "api")) {
@@ -165,34 +180,48 @@ pub fn handleWithPath(self: *Server, req: *http.Server.Request, path_with_query:
 
     if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "agents")) {
         if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
-        return self.handleAdminAgentsApi(req);
+        return self.handleAdminAgentsFragment(req);
     }
 
     if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "inbox")) {
         if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
-        return self.handleAdminInboxApi(req);
+        return self.handleAdminInboxFragment(req);
     }
 
     if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "outbox")) {
         if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
-        return self.handleAdminOutboxApi(req);
+        return self.handleAdminOutboxFragment(req);
     }
 
     if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "archive")) {
         if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
-        return self.handleAdminArchiveApi(req);
+        return self.handleAdminArchiveFragment(req);
     }
 
     if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "workstreams")) {
         if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
-        return self.handleAdminWorkstreamsApi(req);
+        return self.handleAdminWorkstreamsFragment(req);
     }
 
+    if (segments.len == 3 and isSeg(segments[0], "admin") and isSeg(segments[1], "fragments") and isSeg(segments[2], "dispatch")) {
+        if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
+        return self.handleAdminDispatchForm(req);
+    }
+
+    if (segments.len == 3 and isSeg(segments[0], "admin") and isSeg(segments[1], "fragments") and isSeg(segments[2], "workstream-options")) {
+        if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
+        return self.handleAdminWorkstreamOptions(req);
+    }
+
+    // Admin dispatch: form-encoded input (htmx submits the <form> as
+    // application/x-www-form-urlencoded), HTML-fragment output (a toast).
     if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "dispatch")) {
         if (method != .POST) return errJson(a, req, .method_not_allowed, "method not allowed");
         return self.handleAdminDispatch(req, body);
     }
 
+    // Admin register-agent: form-encoded input, HTML-fragment output (the
+    // refreshed agents <tbody> so htmx swaps it in place).
     if (segments.len == 2 and isSeg(segments[0], "admin") and isSeg(segments[1], "register-agent")) {
         if (method != .POST) return errJson(a, req, .method_not_allowed, "method not allowed");
         return self.handleAdminRegisterAgent(req);
@@ -454,8 +483,84 @@ fn htmlResp(req: *http.Server.Request, body: []const u8) !void {
     } });
 }
 
+/// HTML-escape `src` into `buf`. Replaces the browser-side `escapeHtml()` and,
+/// for admin views, the server-side JSON escapers (`jsonString`/`jsonPayload`).
+/// Escapes &, <, >, ", ' to prevent HTML injection from user-supplied data.
+fn htmlEscape(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, src: []const u8) !void {
+    for (src) |c| {
+        switch (c) {
+            '&' => try buf.appendSlice(allocator, "&amp;"),
+            '<' => try buf.appendSlice(allocator, "&lt;"),
+            '>' => try buf.appendSlice(allocator, "&gt;"),
+            '"' => try buf.appendSlice(allocator, "&quot;"),
+            '\'' => try buf.appendSlice(allocator, "&#39;"),
+            else => try buf.append(allocator, c),
+        }
+    }
+}
+
+/// Respond with an HTML error fragment (a toast) at the given HTTP status.
+/// htmx 4 swaps 4xx/5xx responses into the target by default, so the error
+/// toast lands in the user-visible target with zero client-side JS.
+fn htmlError(a: std.mem.Allocator, req: *http.Server.Request, status: http.Status, msg: []const u8) !void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.appendSlice(a, "<div class=\"toast error\">");
+    try htmlEscape(&buf, a, msg);
+    try buf.appendSlice(a, "</div>");
+    try req.respond(buf.items, .{ .status = status, .extra_headers = &.{
+        .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+    } });
+}
+
+/// Extract a field from an `application/x-www-form-urlencoded` body.
+/// URL-decodes the value. Returns a caller-owned slice (allocator), or null if
+/// the field is absent. Replaces `extractJsonField`+`stripJsonString` for the
+/// form-encoded admin dispatch/register routes (the agent JSON routes keep
+/// `extractJsonField`).
+fn formField(body: []const u8, key: []const u8, allocator: std.mem.Allocator) ?[]u8 {
+    var it = mem.splitScalar(u8, body, '&');
+    while (it.next()) |pair| {
+        const eq = mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (!mem.eql(u8, pair[0..eq], key)) continue;
+        const enc = pair[eq + 1 ..];
+        // URL-decode (%XX and +).
+        const out = allocator.alloc(u8, enc.len) catch return null;
+        var oi: usize = 0;
+        var i: usize = 0;
+        while (i < enc.len) : (i += 1) {
+            if (enc[i] == '+') {
+                out[oi] = ' ';
+                oi += 1;
+            } else if (enc[i] == '%' and i + 2 < enc.len) {
+                const hi = std.fmt.charToDigit(enc[i + 1], 16) catch {
+                    out[oi] = enc[i];
+                    oi += 1;
+                    continue;
+                };
+                const lo = std.fmt.charToDigit(enc[i + 2], 16) catch {
+                    out[oi] = enc[i];
+                    oi += 1;
+                    continue;
+                };
+                out[oi] = @intCast(hi * 16 + lo);
+                oi += 1;
+                i += 2;
+            } else {
+                out[oi] = enc[i];
+                oi += 1;
+            }
+        }
+        return allocator.realloc(out, oi) catch out[0..oi];
+    }
+    return null;
+}
+
 /// Admin UI HTML, embedded from src/web/admin.html at compile time.
 const admin_page_html = @embedFile("web/admin.html");
+/// htmx 4 library, embedded at compile time so the binary is self-contained
+/// (no CDN/runtime dependency; same approach as the SQLite amalgamation).
+const htmx_js = @embedFile("web/htmx.min.js");
 
 fn handleAdminPage(_: *Server, req: *http.Server.Request) !void {
     const page = admin_page_html;
@@ -472,152 +577,231 @@ fn handleAdminApi(self: *Server, req: *http.Server.Request) !void {
     try json(req, .ok, body);
 }
 
-fn handleAdminAgentsApi(self: *Server, req: *http.Server.Request) !void {
-    if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
+fn handleAdminAgentsFragment(self: *Server, req: *http.Server.Request) !void {
+    if (!requireAdmin(req)) return htmlError(self.allocator, req, .unauthorized, "unauthorized");
     const a = self.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
-    try buf.appendSlice(a, "{\"agents\":[");
-    var first = true;
-    var it = self.agents.iterator();
-    while (it.next()) |entry| {
-        if (!first) try buf.appendSlice(a, ",");
-        first = false;
-        try buf.print(a, "{{\"agent_id\":\"{s}\",\"secret\":\"{s}\"}}", .{ entry.key_ptr.*, entry.value_ptr.* });
+    try buf.appendSlice(a, "<h2 id=\"agents\">🤖 Registered Agents</h2>");
+    if (self.agents.count() == 0) {
+        try buf.appendSlice(a, "<p>No agents registered.</p>");
+    } else {
+        try buf.appendSlice(a, "<table class=\"resp-table\" id=\"agents-table\"><thead><tr><th>Agent ID</th><th>Secret</th></tr></thead><tbody>");
+        var it = self.agents.iterator();
+        while (it.next()) |entry| {
+            try buf.appendSlice(a, "<tr><td data-label=\"Agent ID\">");
+            try htmlEscape(&buf, a, entry.key_ptr.*);
+            try buf.appendSlice(a, "</td><td data-label=\"Secret\"><code>");
+            try htmlEscape(&buf, a, entry.value_ptr.*);
+            try buf.appendSlice(a, "</code></td></tr>");
+        }
+        try buf.appendSlice(a, "</tbody></table>");
     }
-    try buf.appendSlice(a, "]}");
-    try json(req, .ok, buf.items);
+    try htmlResp(req, buf.items);
 }
 
-fn handleAdminInboxApi(self: *Server, req: *http.Server.Request) !void {
-    if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
+fn handleAdminInboxFragment(self: *Server, req: *http.Server.Request) !void {
+    if (!requireAdmin(req)) return htmlError(self.allocator, req, .unauthorized, "unauthorized");
     const a = self.allocator;
-    const tasks = self.store.fetchInbox(a) catch |err| return errJson(a, req, .internal_server_error, @errorName(err));
+    const tasks = self.store.fetchInbox(a) catch |err| return htmlError(a, req, .internal_server_error, @errorName(err));
     defer { for (tasks) |t| t.deinit(a); a.free(tasks); }
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
-    try buf.appendSlice(a, "{\"tasks\":[");
-    var first = true;
-    for (tasks) |t| {
-        if (!first) try buf.appendSlice(a, ",");
-        first = false;
-        const locked_s = if (t.locked_until) |lu| lu else "null";
-        try buf.print(a, "{{\"task_id\":\"{s}\",\"agent_id\":\"{s}\",\"tenant_id\":\"{s}\",\"action\":\"{s}\",\"payload\":", .{t.task_id, t.agent_id, t.tenant_id, t.action});
-        try jsonPayload(&buf, a, t.payload);
-        try buf.print(a, ",\"try_count\":{d},\"locked_until\":\"{s}\",", .{ t.try_count, locked_s });
-        try emitOptField(&buf, a, "workstream_id", t.workstream_id);
-        try buf.appendSlice(a, "}");
+    try buf.appendSlice(a, "<h2 id=\"inbox\">📥 Inbox (Pending Tasks)</h2>");
+    if (tasks.len == 0) {
+        try buf.appendSlice(a, "<p>No pending tasks.</p>");
+    } else {
+        try buf.appendSlice(a, "<table class=\"resp-table\"><thead><tr><th>Task ID</th><th>Workstream</th><th>Agent</th><th>Action</th><th>Payload</th><th>Try</th><th>Locked Until</th></tr></thead><tbody>");
+        for (tasks) |t| {
+            const lock_class = if (t.locked_until != null) "locked" else "pending";
+            try buf.appendSlice(a, "<tr><td data-label=\"Task ID\"><code>");
+            try htmlEscape(&buf, a, t.task_id);
+            try buf.appendSlice(a, "</code></td><td data-label=\"Workstream\"><code>");
+            if (t.workstream_id) |w| try htmlEscape(&buf, a, w) else try buf.appendSlice(a, "-");
+            try buf.appendSlice(a, "</code></td><td data-label=\"Agent\">");
+            try htmlEscape(&buf, a, t.agent_id);
+            try buf.appendSlice(a, "</td><td data-label=\"Action\">");
+            try htmlEscape(&buf, a, t.action);
+            try buf.appendSlice(a, "</td><td data-label=\"Payload\"><pre>");
+            try htmlEscape(&buf, a, t.payload);
+            try buf.appendSlice(a, "</pre></td><td data-label=\"Try\"><span class=\"status-badge ");
+            try buf.appendSlice(a, lock_class);
+            try buf.print(a, "\">{d}</span></td><td data-label=\"Locked Until\">", .{t.try_count});
+            if (t.locked_until) |lu| try htmlEscape(&buf, a, lu) else try buf.appendSlice(a, "-");
+            try buf.appendSlice(a, "</td></tr>");
+        }
+        try buf.appendSlice(a, "</tbody></table>");
     }
-    try buf.appendSlice(a, "]}");
-    try json(req, .ok, buf.items);
+    try htmlResp(req, buf.items);
 }
 
-fn handleAdminOutboxApi(self: *Server, req: *http.Server.Request) !void {
-    if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
+/// Shared builder for the outbox and archive tables (same columns). The
+/// `consumed_label` differs: outbox shows "waiting for consumer…", archive
+/// shows "aged out unconsumed" for null consumed_at.
+fn writeOutboxTable(buf: *std.ArrayList(u8), a: std.mem.Allocator, tasks: []const types.OutboxResult, consumed_label: []const u8) !void {
+    if (tasks.len == 0) {
+        try buf.appendSlice(a, "<p>No completed tasks.</p>");
+        return;
+    }
+    try buf.appendSlice(a, "<table class=\"resp-table\"><thead><tr><th>Task ID</th><th>Workstream</th><th>Action</th><th>Payload</th><th>Output</th><th>Completed At</th><th>Consumed At</th></tr></thead><tbody>");
+    for (tasks) |t| {
+        try buf.appendSlice(a, "<tr><td data-label=\"Task ID\"><code>");
+        try htmlEscape(buf, a, t.task_id);
+        try buf.appendSlice(a, "</code></td><td data-label=\"Workstream\"><code>");
+        if (t.workstream_id) |w| try htmlEscape(buf, a, w) else try buf.appendSlice(a, "-");
+        try buf.appendSlice(a, "</code></td><td data-label=\"Action\">");
+        try htmlEscape(buf, a, t.action);
+        try buf.appendSlice(a, "</td><td data-label=\"Payload\"><pre>");
+        try htmlEscape(buf, a, t.payload);
+        try buf.appendSlice(a, "</pre></td><td data-label=\"Output\"><pre>");
+        try htmlEscape(buf, a, t.output);
+        try buf.appendSlice(a, "</pre></td><td data-label=\"Completed At\">");
+        try htmlEscape(buf, a, t.completed_at);
+        try buf.appendSlice(a, "</td><td data-label=\"Consumed At\">");
+        if (t.consumed_at) |c| try htmlEscape(buf, a, c) else try buf.appendSlice(a, consumed_label);
+        try buf.appendSlice(a, "</td></tr>");
+    }
+    try buf.appendSlice(a, "</tbody></table>");
+}
+
+fn handleAdminOutboxFragment(self: *Server, req: *http.Server.Request) !void {
+    if (!requireAdmin(req)) return htmlError(self.allocator, req, .unauthorized, "unauthorized");
     const a = self.allocator;
-    const tasks = self.store.fetchOutboxAll(a) catch |err| return errJson(a, req, .internal_server_error, @errorName(err));
+    const tasks = self.store.fetchOutboxAll(a) catch |err| return htmlError(a, req, .internal_server_error, @errorName(err));
     defer { for (tasks) |t| t.deinit(a); a.free(tasks); }
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
-    try buf.appendSlice(a, "{\"tasks\":[");
-    var first = true;
-    for (tasks) |t| {
-        if (!first) try buf.appendSlice(a, ",");
-        first = false;
-        try buf.print(a, "{{\"task_id\":\"{s}\",\"action\":\"{s}\",\"payload\":", .{t.task_id, t.action});
-        try jsonPayload(&buf, a, t.payload);
-        try buf.appendSlice(a, ",\"output\":");
-        try jsonPayload(&buf, a, t.output);
-        try buf.print(a, ",\"completed_at\":\"{s}\",", .{t.completed_at});
-        try emitOptField(&buf, a, "workstream_id", t.workstream_id);
-        try buf.appendSlice(a, ",");
-        try emitOptField(&buf, a, "consumed_at", t.consumed_at);
-        try buf.appendSlice(a, "}");
-    }
-    try buf.appendSlice(a, "]}");
-    try json(req, .ok, buf.items);
+    try buf.appendSlice(a, "<h2 id=\"outbox\">📤 Outbox (Completed Tasks)</h2><p>Results stay here until a consumer <em>acks</em> them (POST /v1/agents/&lt;id&gt;/outbox/&lt;task&gt;/ack). Consumed results retire to the archive after a grace window.</p>");
+    try writeOutboxTable(&buf, a, tasks, "<em>waiting for consumer…</em>");
+    try htmlResp(req, buf.items);
 }
 
-fn handleAdminArchiveApi(self: *Server, req: *http.Server.Request) !void {
-    if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
+fn handleAdminArchiveFragment(self: *Server, req: *http.Server.Request) !void {
+    if (!requireAdmin(req)) return htmlError(self.allocator, req, .unauthorized, "unauthorized");
     const a = self.allocator;
-    const tasks = self.store.fetchArchive(a) catch |err| return errJson(a, req, .internal_server_error, @errorName(err));
+    const tasks = self.store.fetchArchive(a) catch |err| return htmlError(a, req, .internal_server_error, @errorName(err));
     defer { for (tasks) |t| t.deinit(a); a.free(tasks); }
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
-    try buf.appendSlice(a, "{\"tasks\":[");
-    var first = true;
-    for (tasks) |t| {
-        if (!first) try buf.appendSlice(a, ",");
-        first = false;
-        try buf.print(a, "{{\"task_id\":\"{s}\",\"action\":\"{s}\",\"payload\":", .{t.task_id, t.action});
-        try jsonPayload(&buf, a, t.payload);
-        try buf.appendSlice(a, ",\"output\":");
-        try jsonPayload(&buf, a, t.output);
-        try buf.print(a, ",\"completed_at\":\"{s}\",", .{t.completed_at});
-        try emitOptField(&buf, a, "workstream_id", t.workstream_id);
-        try buf.appendSlice(a, ",");
-        try emitOptField(&buf, a, "consumed_at", t.consumed_at);
-        try buf.appendSlice(a, "}");
-    }
-    try buf.appendSlice(a, "]}");
-    try json(req, .ok, buf.items);
+    try buf.appendSlice(a, "<h2 id=\"archive\">🗄️ Archive (Retired Tasks)</h2><p>Consumed (or aged-out) results, kept forever. Nothing is ever hard-deleted.</p>");
+    try writeOutboxTable(&buf, a, tasks, "<em>aged out unconsumed</em>");
+    try htmlResp(req, buf.items);
 }
 
-fn handleAdminWorkstreamsApi(self: *Server, req: *http.Server.Request) !void {
-    if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
+fn handleAdminWorkstreamsFragment(self: *Server, req: *http.Server.Request) !void {
+    if (!requireAdmin(req)) return htmlError(self.allocator, req, .unauthorized, "unauthorized");
     const a = self.allocator;
-    const streams = self.store.fetchWorkstreams(a) catch |err| return errJson(a, req, .internal_server_error, @errorName(err));
+    const streams = self.store.fetchWorkstreams(a) catch |err| return htmlError(a, req, .internal_server_error, @errorName(err));
     defer { for (streams) |s| s.deinit(a); a.free(streams); }
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
-    try buf.appendSlice(a, "{\"workstreams\":[");
-    var first = true;
-    for (streams) |s| {
-        if (!first) try buf.appendSlice(a, ",");
-        first = false;
-        try buf.appendSlice(a, "{\"workstream_id\":");
-        try jsonString(&buf, a, s.workstream_id);
-        try buf.appendSlice(a, ",\"name\":");
-        try jsonString(&buf, a, s.name);
-        try buf.print(a, ",\"task_count\":{d},\"last_seen\":", .{s.task_count});
-        try jsonString(&buf, a, s.last_seen);
-        try buf.appendSlice(a, ",\"created_at\":");
-        try jsonString(&buf, a, s.created_at);
-        try buf.appendSlice(a, "}");
+    try buf.appendSlice(a, "<h2 id=\"workstreams\">🔗 Workstreams</h2>");
+    if (streams.len == 0) {
+        try buf.appendSlice(a, "<p>No workstreams yet. Dispatch a task with a workstream name to create one.</p>");
+    } else {
+        try buf.appendSlice(a, "<table class=\"resp-table\"><thead><tr><th>Name</th><th>Workstream ID</th><th>Tasks</th><th>Last Activity</th><th>Created</th></tr></thead><tbody>");
+        for (streams) |s| {
+            try buf.appendSlice(a, "<tr><td data-label=\"Name\">");
+            if (s.name.len > 0) try htmlEscape(&buf, a, s.name) else try buf.appendSlice(a, "<em>(unnamed)</em>");
+            try buf.appendSlice(a, "</td><td data-label=\"Workstream ID\"><code>");
+            try htmlEscape(&buf, a, s.workstream_id);
+            try buf.print(a, "</code></td><td data-label=\"Tasks\">{d}</td><td data-label=\"Last Activity\">", .{s.task_count});
+            if (s.last_seen.len > 0) try htmlEscape(&buf, a, s.last_seen) else try buf.appendSlice(a, "-");
+            try buf.appendSlice(a, "</td><td data-label=\"Created\">");
+            if (s.created_at.len > 0) try htmlEscape(&buf, a, s.created_at) else try buf.appendSlice(a, "-");
+            try buf.appendSlice(a, "</td></tr>");
+        }
+        try buf.appendSlice(a, "</tbody></table>");
     }
-    try buf.appendSlice(a, "]}");
-    try json(req, .ok, buf.items);
+    try htmlResp(req, buf.items);
+}
+
+/// The dispatch <form> fragment. htmx swaps this into #content when the
+/// "Send Task" nav link is clicked. The form itself hx-posts to /admin/dispatch
+/// on submit and swaps the toast into #dispatchResult. The workstream <select>
+/// seeds its <option>s from /admin/fragments/workstream-options on load.
+fn handleAdminDispatchForm(self: *Server, req: *http.Server.Request) !void {
+    if (!requireAdmin(req)) return htmlError(self.allocator, req, .unauthorized, "unauthorized");
+    const form =
+        \\ <h2 id="dispatch">📨 Send Task to Agent</h2>
+        \\ <form hx-post="/admin/dispatch" hx-target="#dispatchResult" hx-swap="innerHTML">
+        \\   <label>Agent ID
+        \\     <input type="text" name="agent_id" value="agent-0" required />
+        \\   </label>
+        \\   <label>Action
+        \\     <input type="text" name="action" value="process" required />
+        \\   </label>
+        \\   <label>Payload (JSON)
+        \\     <textarea name="payload" rows="4" required>{"key": "value"}</textarea>
+        \\   </label>
+        \\   <fieldset style="border:1px solid #ddd;padding:.5rem .75rem;margin-bottom:1rem">
+        \\     <legend style="font-weight:bold">Workstream</legend>
+        \\     <label>Join an existing workstream
+        \\       <select name="workstream_id" id="dispatchWorkstreamId"
+        \\               hx-get="/admin/fragments/workstream-options" hx-target="this" hx-trigger="load">
+        \\         <option value="">— none (create new below) —</option>
+        \\       </select>
+        \\     </label>
+        \\     <label>…or create a new workstream by name
+        \\       <input type="text" name="workstream_name" placeholder="e.g. Daily Newsletter Summary" maxlength="256" />
+        \\     </label>
+        \\     <small style="display:block;color:#888;margin-top:.25rem">Leave both empty to auto-generate an anonymous workstream.</small>
+        \\   </fieldset>
+        \\   <button type="submit">🚀 Dispatch</button>
+        \\ </form>
+        \\ <div id="dispatchResult"></div>
+    ;
+    try htmlResp(req, form);
+}
+
+/// <option> fragment for the dispatch form's workstream <select>.
+/// htmx swaps these into the <select> on load (hx-trigger="load").
+fn handleAdminWorkstreamOptions(self: *Server, req: *http.Server.Request) !void {
+    if (!requireAdmin(req)) return htmlError(self.allocator, req, .unauthorized, "unauthorized");
+    const a = self.allocator;
+    const streams = self.store.fetchWorkstreams(a) catch |err| return htmlError(a, req, .internal_server_error, @errorName(err));
+    defer { for (streams) |s| s.deinit(a); a.free(streams); }
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    // htmx swaps into the <select>; the leading option is kept (it is not
+    // replaced because hx-swap="innerHTML" replaces the children, and the
+    // existing placeholder option is part of the children). To keep the
+    // placeholder, we re-emit it first.
+    try buf.appendSlice(a, "<option value=\"\">— none (create new below) —</option>");
+    for (streams) |s| {
+        try buf.appendSlice(a, "<option value=\"");
+        try htmlEscape(&buf, a, s.workstream_id);
+        try buf.appendSlice(a, "\">");
+        if (s.name.len > 0) try htmlEscape(&buf, a, s.name) else try buf.appendSlice(a, "(unnamed)");
+        try buf.print(a, " — {d} tasks</option>", .{s.task_count});
+    }
+    try htmlResp(req, buf.items);
 }
 
 fn handleAdminDispatch(self: *Server, req: *http.Server.Request, body: []const u8) !void {
-    if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
+    if (!requireAdmin(req)) return htmlError(self.allocator, req, .unauthorized, "unauthorized");
     const a = self.allocator;
-    // Parse JSON body: { "agent_id": "...", "action": "...", "payload": "...",
-    //                    "workstream_id": "..." | "workstream_name": "..." }
-    // We use a simple approach – extract fields via json scanning.
-    const agent_id = extractJsonField(body, "agent_id", a) orelse return errJson(a, req, .bad_request, "missing agent_id");
+    // Parse form-encoded body (htmx submits the <form> as
+    // application/x-www-form-urlencoded). formField URL-decodes values.
+    const agent_id = formField(body, "agent_id", a) orelse return htmlError(a, req, .bad_request, "missing agent_id");
     defer a.free(agent_id);
-    const action = extractJsonField(body, "action", a) orelse return errJson(a, req, .bad_request, "missing action");
+    const action = formField(body, "action", a) orelse return htmlError(a, req, .bad_request, "missing action");
     defer a.free(action);
-    const payload_raw = extractJsonField(body, "payload", a) orelse return errJson(a, req, .bad_request, "missing payload");
+    const payload_raw = formField(body, "payload", a) orelse return htmlError(a, req, .bad_request, "missing payload");
     defer a.free(payload_raw);
 
     // Resolve the workstream id. Three modes (first match wins):
     //   1. workstream_id given  → must already exist (lookup), else 400.
     //   2. workstream_name given → lookup by name; if found join, if not create + join.
     //   3. neither given         → generate a fresh workstream UUID (no name row).
-    // extractJsonField allocates a raw token; stripJsonString returns a slice into it.
-    // We keep the raw allocation for cleanup and derive the stripped view from it.
-    const ws_id_raw = extractJsonField(body, "workstream_id", a);
-    defer if (ws_id_raw) |w| a.free(w);
-    const ws_name_raw = extractJsonField(body, "workstream_name", a);
-    defer if (ws_name_raw) |w| a.free(w);
-    const ws_id = stripJsonString(ws_id_raw);
-    const ws_name = stripJsonString(ws_name_raw);
+    // Empty strings (e.g. the "— none —" placeholder option) count as not-given.
+    const ws_id = formField(body, "workstream_id", a);
+    defer if (ws_id) |w| a.free(w);
+    const ws_name = formField(body, "workstream_name", a);
+    defer if (ws_name) |w| a.free(w);
 
     // Check agent exists
-    if (!self.agents.contains(agent_id)) return errJson(a, req, .bad_request, "unknown agent");
+    if (!self.agents.contains(agent_id)) return htmlError(a, req, .bad_request, "unknown agent");
 
     // Generate a unique task id (t_ + v4 UUID).
     const task_id = try uuid.newTaskId(self.io, a);
@@ -625,45 +809,60 @@ fn handleAdminDispatch(self: *Server, req: *http.Server.Request, body: []const u
 
     // Resolve the workstream id per the three modes above.
     // `owned_ws` owns any id we allocate (lookup dupe or new UUID); freed at end.
+    // `ws` is null only when the user explicitly left both workstream fields empty
+    // (mode 3) AND we fell through the empty-string short-circuits above — in that
+    // case we generate a fresh anonymous id here so dispatch always gets a value.
     var owned_ws: ?[]u8 = null;
     defer if (owned_ws) |w| a.free(w);
-    const ws: []const u8 = blk: {
+    const ws: ?[]const u8 = blk: {
         if (ws_id) |id| {
+            if (id.len == 0) break :blk null;
             // Mode 1: explicit id — must exist.
             const found = try self.store.lookupWorkstreamById(a, id);
             if (found) |fid| { owned_ws = fid; break :blk fid; }
-            return errJson(a, req, .bad_request, "workstream_id not found");
+            return htmlError(a, req, .bad_request, "workstream_id not found");
         }
         if (ws_name) |name| {
+            if (name.len > 256) return htmlError(a, req, .bad_request, "workstream_name exceeds 256 characters");
+            if (name.len == 0) break :blk null;
             // Mode 2: name — lookup, then create-or-join.
-            if (name.len > 256) return errJson(a, req, .bad_request, "workstream_name exceeds 256 characters");
             const found = try self.store.lookupWorkstreamByName(a, name);
             if (found) |fid| { owned_ws = fid; break :blk fid; }
             // Not found — create it. A duplicate name (race or deliberate) → 409.
             const new_id = try uuid.newWorkstreamId(self.io, a);
             owned_ws = new_id;
             self.store.createWorkstream(new_id, name) catch |err| {
-                if (err == error.DuplicateWorkstreamName) return errJson(a, req, .conflict, "workstream name already exists");
-                return errJson(a, req, .internal_server_error, @errorName(err));
+                if (err == error.DuplicateWorkstreamName) return htmlError(a, req, .conflict, "workstream name already exists");
+                return htmlError(a, req, .internal_server_error, @errorName(err));
             };
             break :blk new_id;
         }
         // Mode 3: neither given — generate a fresh anonymous workstream id (w_ + UUID).
+        break :blk null;
+    };
+    // If all three modes fell through to null, generate the anonymous id now.
+    const ws_final: []const u8 = if (ws) |w| w else blk: {
         const new_id = try uuid.newWorkstreamId(self.io, a);
         owned_ws = new_id;
         break :blk new_id;
     };
 
-    self.store.dispatch("default-team", agent_id, task_id, action, payload_raw, ws) catch |err| {
-        return errJson(a, req, .internal_server_error, @errorName(err));
+    self.store.dispatch("default-team", agent_id, task_id, action, payload_raw, ws_final) catch |err| {
+        return htmlError(a, req, .internal_server_error, @errorName(err));
     };
-    const resp = try fmt.allocPrint(a, "{{\"task_id\":\"{s}\",\"workstream_id\":\"{s}\",\"status\":\"dispatched\"}}", .{ task_id, ws });
-    defer a.free(resp);
-    try json(req, .ok, resp);
+    // Respond with an HTML toast fragment; htmx swaps it into #dispatchResult.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.appendSlice(a, "<div class=\"toast success\">✅ Task dispatched: <code>");
+    try htmlEscape(&buf, a, task_id);
+    try buf.appendSlice(a, "</code><br>workstream: <code>");
+    try htmlEscape(&buf, a, ws_final);
+    try buf.appendSlice(a, "</code></div>");
+    try htmlResp(req, buf.items);
 }
 
 fn handleAdminRegisterAgent(self: *Server, req: *http.Server.Request) !void {
-    if (!requireAdmin(req)) return errJson(self.allocator, req, .unauthorized, "unauthorized");
+    if (!requireAdmin(req)) return htmlError(self.allocator, req, .unauthorized, "unauthorized");
     const a = self.allocator;
     var buf: [32]u8 = undefined;
     self.io.random(&buf);
@@ -672,9 +871,19 @@ fn handleAdminRegisterAgent(self: *Server, req: *http.Server.Request) !void {
     const agent_id = try fmt.allocPrint(a, "agent-{d}", .{self.agents.count()});
     errdefer a.free(agent_id);
     try self.agents.put(agent_id, try a.dupe(u8, secret));
-    const resp = try fmt.allocPrint(a, "{{\"agent_id\":\"{s}\",\"agent_secret\":\"{s}\",\"team_id\":\"default\"}}", .{ agent_id, secret });
-    defer a.free(resp);
-    try json(req, .ok, resp);
+    // Respond with the refreshed agents <tbody> so htmx swaps it in place of
+    // the old #agents-table tbody (hx-target="#agents-table tbody").
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    var it = self.agents.iterator();
+    while (it.next()) |entry| {
+        try out.appendSlice(a, "<tr><td data-label=\"Agent ID\">");
+        try htmlEscape(&out, a, entry.key_ptr.*);
+        try out.appendSlice(a, "</td><td data-label=\"Secret\"><code>");
+        try htmlEscape(&out, a, entry.value_ptr.*);
+        try out.appendSlice(a, "</code></td></tr>");
+    }
+    try htmlResp(req, out.items);
 }
 
 /// Emit a properly-escaped JSON string (opening + closing quotes, escaped contents).
@@ -725,62 +934,6 @@ fn jsonPayload(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, raw: []con
         }
         try buf.append(allocator, '"');
     }
-}
-
-/// Strip surrounding double-quotes from a raw JSON token and interpret `"null"` as
-/// absent. Returns null when the value is missing, the literal `null`, or empty.
-fn stripJsonString(raw: ?[]const u8) ?[]const u8 {
-    if (raw) |w| {
-        if (w.len >= 2 and w[0] == '"' and w[w.len - 1] == '"') return w[1 .. w.len - 1];
-        if (w.len > 0 and !mem.eql(u8, w, "null")) return w;
-    }
-    return null;
-}
-
-/// Scan for `"<key>":` then extract the value (string, object, or literal).
-fn extractJsonField(body: []const u8, key: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
-    const a = allocator;
-    // find "<key>"  (with optional whitespace after colon)
-    var pos: usize = 0;
-    while (pos < body.len) {
-        // find quote
-        const q = mem.indexOfScalarPos(u8, body, pos, '"') orelse return null;
-        const end_q = mem.indexOfScalarPos(u8, body, q + 1, '"') orelse return null;
-        const k = body[q + 1 .. end_q];
-        if (mem.eql(u8, k, key)) {
-            // found key, skip colon and whitespace
-            var p = end_q + 1;
-            while (p < body.len and (body[p] == ':' or body[p] == ' ' or body[p] == '\t')) : (p += 1) {}
-            if (p >= body.len) return null;
-            const c = body[p];
-            if (c == '"') {
-                // string
-                var i: usize = p + 1;
-                while (i < body.len) : (i += 1) {
-                    if (body[i] == '\\' and i + 1 < body.len) { i += 1; continue; }
-                    if (body[i] == '"') {
-                        return a.dupe(u8, body[p + 1 .. i]) catch null;
-                    }
-                }
-                return null;
-            } else if (c == '{' or c == '[') {
-                var depth: u32 = 1;
-                var i: usize = p + 1;
-                while (i < body.len and depth > 0) : (i += 1) {
-                    if (body[i] == '{' or body[i] == '[') depth += 1;
-                    if (body[i] == '}' or body[i] == ']') depth -= 1;
-                }
-                return a.dupe(u8, body[p..i]) catch null;
-            } else {
-                // number / bool / null
-                var i: usize = p;
-                while (i < body.len and body[i] != ',' and body[i] != '}' and body[i] != ']') : (i += 1) {}
-                return a.dupe(u8, body[p..i]) catch null;
-            }
-        }
-        pos = end_q + 1;
-    }
-    return null;
 }
 
 pub fn registerDefaultAgent(self: *Server) !void {

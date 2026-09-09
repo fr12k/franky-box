@@ -71,19 +71,10 @@
     display: flex;
     align-items: center;
     gap: 0.4rem;
-  }
-  .navbar-toggle {
-    display: none;
-    background: none;
-    border: 1px solid var(--primary);
-    color: var(--primary);
-    font-size: 1.4rem;
-    line-height: 1;
-    padding: 0.25rem 0.6rem;
-    border-radius: 6px;
     cursor: pointer;
+    list-style: none;            /* hide default <summary> marker */
   }
-  .navbar-toggle:focus { outline: 2px solid var(--primary); }
+  .navbar-brand::-webkit-details-marker { display: none; }
   .navbar-links {
     display: flex;
     flex-wrap: wrap;
@@ -105,10 +96,21 @@
   .navbar-links li a:hover,
   .navbar-links li a:focus { background: var(--primary-focus); }
 
+  /* On desktop, force the <details> content visible regardless of open
+     state (the nav is always expanded above 600px). */
+  @media (min-width: 601px) {
+    .navbar[open] .navbar-links,
+    .navbar:not([open]) .navbar-links { display: flex; }
+    .navbar > summary { list-style: none; }
+  }
+
   /* ─── Mobile nav ─── */
+  /* <details> collapses the nav on narrow screens; <summary> is the
+     hamburger. Works with no JS (progressive enhancement). */
   @media (max-width: 600px) {
     body { padding: 0.25rem; }
-    .navbar-toggle { display: block; }
+    .navbar { flex-direction: column; align-items: stretch; }
+    .navbar-brand { width: 100%; }
     .navbar-links {
       display: none;
       flex-direction: column;
@@ -116,7 +118,7 @@
       margin-top: 0.5rem;
       gap: 0.15rem;
     }
-    .navbar-links.open { display: flex; }
+    .navbar[open] .navbar-links { display: flex; }
     .navbar-links li a {
       padding: 0.6rem 0.75rem;
       font-size: 1rem;
@@ -185,296 +187,30 @@
 </head>
 <body>
 <nav class="container-fluid">
-  <div class="navbar">
-    <div class="navbar-brand">🔧 Franky-Box Admin</div>
-    <button class="navbar-toggle" id="navToggle" aria-label="Toggle navigation menu">☰</button>
-    <ul class="navbar-links" id="navLinks">
-      <li><a href="#agents" onclick="loadAgents(); closeNav();">Agents</a></li>
-      <li><a href="#inbox" onclick="loadInbox(); closeNav();">Inbox</a></li>
-      <li><a href="#outbox" onclick="loadOutbox(); closeNav();">Outbox</a></li>
-      <li><a href="#archive" onclick="loadArchive(); closeNav();">Archive</a></li>
-      <li><a href="#workstreams" onclick="loadWorkstreams(); closeNav();">Workstreams</a></li>
-      <li><a href="#dispatch" onclick="showDispatch(); closeNav();">Send Task</a></li>
+  <details class="navbar">
+    <summary class="navbar-brand">🔧 Franky-Box Admin</summary>
+    <ul class="navbar-links">
+      <li><a hx-get="/admin/agents"      hx-target="#content" hx-push-url="/admin#agents">Agents</a></li>
+      <li><a hx-get="/admin/inbox"       hx-target="#content" hx-push-url="/admin#inbox">Inbox</a></li>
+      <li><a hx-get="/admin/outbox"      hx-target="#content" hx-push-url="/admin#outbox">Outbox</a></li>
+      <li><a hx-get="/admin/archive"     hx-target="#content" hx-push-url="/admin#archive">Archive</a></li>
+      <li><a hx-get="/admin/workstreams" hx-target="#content" hx-push-url="/admin#workstreams">Workstreams</a></li>
+      <li><a hx-get="/admin/fragments/dispatch" hx-target="#content" hx-push-url="/admin#dispatch">Send Task</a></li>
     </ul>
-  </div>
+  </details>
 </nav>
 <main class="container">
   <hr/>
-  <section id="content">
-    <p>Select a tab above.</p>
+  <!-- hx-trigger="load" fires once on page load, seeding the Agents table
+       (replaces the loadAgentsOnStart() IIFE). hx-indicator shows the
+       spinner during the request. -->
+  <section id="content"
+           hx-get="/admin/agents"
+           hx-trigger="load"
+           hx-swap="innerHTML">
+    <div class="spinner" hx-indicator="this"></div>
   </section>
 </main>
-<script>
-// ─── Cookie / Auth helpers ────────────────────────────────────────
-function getCookie(name) {
-  const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
-  return match ? match[2] : null;
-}
-function token() { return getCookie('fb_admin_token'); }
-function headers() { return { 'Authorization': 'Bearer ' + token(), 'Accept': 'application/json' }; }
-
-// ─── Nav toggle ──────────────────────────────────────────────────
-function closeNav() {
-  document.getElementById('navLinks').classList.remove('open');
-}
-document.getElementById('navToggle').addEventListener('click', function(e) {
-  e.stopPropagation();
-  document.getElementById('navLinks').classList.toggle('open');
-});
-// Close nav when clicking outside
-document.addEventListener('click', function(e) {
-  const nav = document.getElementById('navLinks');
-  const toggle = document.getElementById('navToggle');
-  if (!nav.contains(e.target) && !toggle.contains(e.target)) {
-    nav.classList.remove('open');
-  }
-});
-
-// ─── API helper ──────────────────────────────────────────────────
-async function api(url) {
-  const r = await fetch(url, { headers: headers() });
-  if (!r.ok) { const e = await r.json(); throw new Error(e.error || r.statusText); }
-  return r.json();
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────
-function escapeHtml(s) {
-  if (s === null || s === undefined) return '';
-  if (typeof s !== 'string') s = String(s);
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-function escapeJson(s) {
-  if (s === null || s === undefined) return '';
-  if (typeof s === 'object') s = JSON.stringify(s);
-  try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return escapeHtml(s); }
-}
-function showLoading() {
-  document.getElementById('content').innerHTML = '<div class="spinner"></div>';
-}
-function showToast(type, msg) {
-  return '<div class="toast ' + type + '">' + msg + '</div>';
-}
-
-// ─── Load Agents ─────────────────────────────────────────────────
-async function loadAgents() {
-  const el = document.getElementById('content');
-  showLoading();
-  try {
-    const data = await api('/admin/agents');
-    let html = '<h2 id="agents">🤖 Registered Agents</h2>';
-    if (!data.agents || data.agents.length === 0) {
-      html += '<p>No agents registered.</p>';
-    } else {
-      html += '<table class="resp-table"><thead><tr><th>Agent ID</th><th>Secret</th></tr></thead><tbody>';
-      data.agents.forEach(a => {
-        html += '<tr><td data-label="Agent ID">' + escapeHtml(a.agent_id) + '</td>'
-              + '<td data-label="Secret"><code>' + escapeHtml(a.secret) + '</code></td></tr>';
-      });
-      html += '</tbody></table>';
-    }
-    el.innerHTML = html;
-  } catch(e) { el.innerHTML = showToast('error', '❌ ' + escapeHtml(e.message)); }
-}
-
-// ─── Load Inbox ──────────────────────────────────────────────────
-async function loadInbox() {
-  const el = document.getElementById('content');
-  showLoading();
-  try {
-    const data = await api('/admin/inbox');
-    let html = '<h2 id="inbox">📥 Inbox (Pending Tasks)</h2>';
-    if (!data.tasks || data.tasks.length === 0) {
-      html += '<p>No pending tasks.</p>';
-    } else {
-      html += '<table class="resp-table"><thead><tr><th>Task ID</th><th>Workstream</th><th>Agent</th><th>Action</th><th>Payload</th><th>Try</th><th>Locked Until</th></tr></thead><tbody>';
-      data.tasks.forEach(t => {
-        const lockClass = t.locked_until ? 'locked' : 'pending';
-        html += '<tr>'
-          + '<td data-label="Task ID"><code>' + escapeHtml(t.task_id) + '</code></td>'
-          + '<td data-label="Workstream"><code>' + escapeHtml(t.workstream_id || '-') + '</code></td>'
-          + '<td data-label="Agent">' + escapeHtml(t.agent_id) + '</td>'
-          + '<td data-label="Action">' + escapeHtml(t.action) + '</td>'
-          + '<td data-label="Payload"><pre>' + escapeJson(t.payload) + '</pre></td>'
-          + '<td data-label="Try"><span class="status-badge ' + lockClass + '">' + t.try_count + '</span></td>'
-          + '<td data-label="Locked Until">' + (t.locked_until ? escapeHtml(t.locked_until) : '-') + '</td>'
-          + '</tr>';
-      });
-      html += '</tbody></table>';
-    }
-    el.innerHTML = html;
-  } catch(e) { el.innerHTML = showToast('error', '❌ ' + escapeHtml(e.message)); }
-}
-
-// ─── Load Outbox ─────────────────────────────────────────────────
-async function loadOutbox() {
-  const el = document.getElementById('content');
-  showLoading();
-  try {
-    const data = await api('/admin/outbox');
-    let html = '<h2 id="outbox">📤 Outbox (Completed Tasks)</h2>';
-    html += '<p>Results stay here until a consumer <em>acks</em> them (POST /v1/agents/&lt;id&gt;/outbox/&lt;task&gt;/ack). Consumed results retire to the archive after a grace window.</p>';
-    if (!data.tasks || data.tasks.length === 0) {
-      html += '<p>No completed tasks.</p>';
-    } else {
-      html += '<table class="resp-table"><thead><tr><th>Task ID</th><th>Workstream</th><th>Action</th><th>Payload</th><th>Output</th><th>Completed At</th><th>Consumed At</th></tr></thead><tbody>';
-      data.tasks.forEach(t => {
-        html += '<tr>'
-          + '<td data-label="Task ID"><code>' + escapeHtml(t.task_id) + '</code></td>'
-          + '<td data-label="Workstream"><code>' + escapeHtml(t.workstream_id || '-') + '</code></td>'
-          + '<td data-label="Action">' + escapeHtml(t.action) + '</td>'
-          + '<td data-label="Payload"><pre>' + escapeJson(t.payload) + '</pre></td>'
-          + '<td data-label="Output"><pre>' + escapeJson(t.output) + '</pre></td>'
-          + '<td data-label="Completed At">' + escapeHtml(t.completed_at) + '</td>'
-          + '<td data-label="Consumed At">' + (t.consumed_at ? escapeHtml(t.consumed_at) : '<em>waiting for consumer…</em>') + '</td>'
-          + '</tr>';
-      });
-      html += '</tbody></table>';
-    }
-    el.innerHTML = html;
-  } catch(e) { el.innerHTML = showToast('error', '❌ ' + escapeHtml(e.message)); }
-}
-
-// ─── Load Archive ─────────────────────────────────────────────────
-async function loadArchive() {
-  const el = document.getElementById('content');
-  showLoading();
-  try {
-    const data = await api('/admin/archive');
-    let html = '<h2 id="archive">🗄️ Archive (Retired Tasks)</h2>';
-    html += '<p>Consumed (or aged-out) results, kept forever. Nothing is ever hard-deleted.</p>';
-    if (!data.tasks || data.tasks.length === 0) {
-      html += '<p>No archived tasks.</p>';
-    } else {
-      html += '<table class="resp-table"><thead><tr><th>Task ID</th><th>Workstream</th><th>Action</th><th>Payload</th><th>Output</th><th>Completed At</th><th>Consumed At</th></tr></thead><tbody>';
-      data.tasks.forEach(t => {
-        html += '<tr>'
-          + '<td data-label="Task ID"><code>' + escapeHtml(t.task_id) + '</code></td>'
-          + '<td data-label="Workstream"><code>' + escapeHtml(t.workstream_id || '-') + '</code></td>'
-          + '<td data-label="Action">' + escapeHtml(t.action) + '</td>'
-          + '<td data-label="Payload"><pre>' + escapeJson(t.payload) + '</pre></td>'
-          + '<td data-label="Output"><pre>' + escapeJson(t.output) + '</pre></td>'
-          + '<td data-label="Completed At">' + escapeHtml(t.completed_at) + '</td>'
-          + '<td data-label="Consumed At">' + (t.consumed_at ? escapeHtml(t.consumed_at) : '<em>aged out unconsumed</em>') + '</td>'
-          + '</tr>';
-      });
-      html += '</tbody></table>';
-    }
-    el.innerHTML = html;
-  } catch(e) { el.innerHTML = showToast('error', '❌ ' + escapeHtml(e.message)); }
-}
-
-// ─── Workstreams ────────────────────────────────────────────────
-async function loadWorkstreams() {
-  const el = document.getElementById('content');
-  showLoading();
-  try {
-    const data = await api('/admin/workstreams');
-    let html = '<h2 id="workstreams">🔗 Workstreams</h2>';
-    if (!data.workstreams || data.workstreams.length === 0) {
-      html += '<p>No workstreams yet. Dispatch a task with a workstream name to create one.</p>';
-    } else {
-      html += '<table class="resp-table"><thead><tr><th>Name</th><th>Workstream ID</th><th>Tasks</th><th>Last Activity</th><th>Created</th></tr></thead><tbody>';
-      data.workstreams.forEach(w => {
-        const name = w.name ? escapeHtml(w.name) : '<em>(unnamed)</em>';
-        html += '<tr>'
-          + '<td data-label="Name">' + name + '</td>'
-          + '<td data-label="Workstream ID"><code>' + escapeHtml(w.workstream_id) + '</code></td>'
-          + '<td data-label="Tasks">' + w.task_count + '</td>'
-          + '<td data-label="Last Activity">' + escapeHtml(w.last_seen || '-') + '</td>'
-          + '<td data-label="Created">' + escapeHtml(w.created_at || '-') + '</td>'
-          + '</tr>';
-      });
-      html += '</tbody></table>';
-    }
-    el.innerHTML = html;
-  } catch(e) { el.innerHTML = showToast('error', '❌ ' + escapeHtml(e.message)); }
-}
-
-// ─── Dispatch ────────────────────────────────────────────────────
-function showDispatch() {
-  const el = document.getElementById('content');
-  el.innerHTML = `
-    <h2 id="dispatch">📨 Send Task to Agent</h2>
-    <form id="dispatchForm" onsubmit="return doDispatch(event)">
-      <label>Agent ID
-        <input type="text" id="dispatchAgent" value="agent-0" required />
-      </label>
-      <label>Action
-        <input type="text" id="dispatchAction" value="process" required />
-      </label>
-      <label>Payload (JSON)
-        <textarea id="dispatchPayload" rows="4" required>{"key": "value"}</textarea>
-      </label>
-      <fieldset style="border:1px solid #ddd;padding:.5rem .75rem;margin-bottom:1rem">
-        <legend style="font-weight:bold">Workstream</legend>
-        <label>Join an existing workstream
-          <select id="dispatchWorkstreamId"><option value="">— none (create new below) —</option></select>
-        </label>
-        <label>…or create a new workstream by name
-          <input type="text" id="dispatchWorkstreamName" placeholder="e.g. Daily Newsletter Summary" maxlength="256" />
-        </label>
-        <small id="workstreamHint" style="display:block;color:#888;margin-top:.25rem">Leave both empty to auto-generate an anonymous workstream.</small>
-      </fieldset>
-      <button type="submit">🚀 Dispatch</button>
-    </form>
-    <div id="dispatchResult"></div>
-  `;
-  loadWorkstreamOptions();
-}
-
-async function loadWorkstreamOptions() {
-  const sel = document.getElementById('dispatchWorkstreamId');
-  const hint = document.getElementById('workstreamHint');
-  if (!sel) return;
-  try {
-    const data = await api('/admin/workstreams');
-    if (data.workstreams && data.workstreams.length > 0) {
-      data.workstreams.forEach(w => {
-        const opt = document.createElement('option');
-        opt.value = w.workstream_id;
-        const label = w.name || '(unnamed)';
-        opt.textContent = label + ' — ' + w.task_count + ' tasks (' + w.workstream_id.slice(0, 8) + '…)';
-        sel.appendChild(opt);
-      });
-      if (hint) hint.textContent = 'Pick an existing workstream above, or type a new name to create one (409 if the name is taken).';
-    } else if (hint) {
-      hint.textContent = 'No existing workstreams yet — type a name to create one, or leave empty to auto-generate.';
-    }
-  } catch (e) {
-    if (hint) hint.textContent = 'Could not load workstreams: ' + escapeHtml(e.message);
-  }
-}
-
-async function doDispatch(event) {
-  event.preventDefault();
-  const el = document.getElementById('dispatchResult');
-  const agent = document.getElementById('dispatchAgent').value;
-  const action = document.getElementById('dispatchAction').value;
-  const payload = document.getElementById('dispatchPayload').value;
-  const wsId = document.getElementById('dispatchWorkstreamId').value.trim();
-  const wsName = document.getElementById('dispatchWorkstreamName').value.trim();
-  el.innerHTML = '<div class="spinner"></div>';
-  try {
-    const body = { agent_id: agent, action: action, payload: payload };
-    // workstream_id takes precedence; otherwise use workstream_name to create-or-join.
-    if (wsId) body.workstream_id = wsId;
-    else if (wsName) body.workstream_name = wsName;
-    const r = await fetch('/admin/dispatch', {
-      method: 'POST',
-      headers: Object.assign(headers(), { 'Content-Type': 'application/json' }),
-      body: JSON.stringify(body)
-    });
-    const data = await r.json();
-    if (!r.ok) throw new Error(data.error || r.statusText);
-    const ws = data.workstream_id ? '<br>workstream: <code>' + escapeHtml(data.workstream_id) + '</code>' : '';
-    el.innerHTML = showToast('success', '✅ Task dispatched: <code>' + escapeHtml(data.task_id) + '</code>' + ws);
-  } catch(e) { el.innerHTML = showToast('error', '❌ ' + escapeHtml(e.message)); }
-  return false;
-}
-
-// ─── Auto-load on start ─────────────────────────────────────────
-async function loadAgentsOnStart() { try { await loadAgents(); } catch { /* ignore */ } }
-loadAgentsOnStart();
-</script>
+<script src="/admin/htmx.min.js"></script>
 </body>
 </html>
