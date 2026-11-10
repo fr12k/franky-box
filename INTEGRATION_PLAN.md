@@ -4,6 +4,16 @@
 **Date:** 2026-08-08  
 **Status:** Draft — v4 (cleaned, no complementary tools, no memory scoping)
 
+> **Update (2026-11-08):** franky-box has since gained P0–P2 features the worker loop
+> should adopt: `POST …/inbox/{task}/heartbeat?extend=N` (call every ~60 s while working —
+> without it any task longer than the 300 s lease is re-queued and double-executed),
+> `POST …/inbox/{task}/input-required` + `…/input` (human-in-the-loop),
+> `POST …/inbox/{task}/cancel`, `GET …/tasks/{task}` (task state), verified grant tokens on
+> `/v1/results/{id}?token=`, and webhook push (`POST /v1/webhooks`) as an alternative to
+> outbox polling. The client library (`src/box_client.zig`) exposes heartbeat/cancel/
+> getTask/requestInput/wellKnownCard. The "passive purge removes tasks >7 days" note in
+> §3 is outdated — see `RETENTION.md` for the ack-based retention model.
+
 ---
 
 ## 1. Architecture Overview

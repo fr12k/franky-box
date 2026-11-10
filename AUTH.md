@@ -2,6 +2,18 @@
 
 This document specifies how the remote 3rd-party `franky-box` service secures agent inboxes and enables secure, credential-free outbox delegation (invitations).
 
+> **Implementation status (2026-11-08):**
+> - ✅ Implemented: bearer-token agent auth (`POST /v1/agents`, now persisted in SQLite with
+>   name/skills/card_url metadata), per-task HMAC grant tokens with **verification**
+>   (`verifyGrantTokenFor` — `/v1/results/{id}?token=` was previously a stub that accepted any
+>   token; tokens are now generated with a real expiry clock and verified constant-time),
+>   admin token (header or cookie) for admin routes, and agent cards.
+> - ⚠️ Partial: producer policies (§2) — dispatch endpoints are unauthenticated (`/v1/tasks/dispatch`)
+>   or admin-token-only (`/v1/tasks/dispatch-advanced`); team-scoped/signed producer tokens are not
+>   implemented.
+> - ❌ Not implemented: multi-tenancy (§4) — `team_id`/tenant is hardcoded `default-team`; grant
+>   revocation — tokens expire but cannot be revoked early.
+
 ---
 
 ## 1. Credential Hierarchy

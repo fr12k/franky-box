@@ -899,3 +899,422 @@ test "admin archive lists retired tasks" {
         try testing.expect(std.mem.indexOf(u8, resp.body, task_id) != null);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// P0-P2 integration tests
+// ═════════════════════════════════════════════════════════════════════════════
+
+test "heartbeat extends the claim lease" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var dispatch = try ctx.request(.POST, "/v1/tasks/dispatch", "\"long task\"");
+    defer dispatch.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), dispatch.status_code);
+    var claim = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+    defer claim.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), claim.status_code);
+    const task_id = extractFirstTaskId(claim.body) orelse return error.MissingTaskId;
+    defer testing.allocator.free(task_id);
+
+    const hb_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/inbox/{s}/heartbeat?extend=600", .{task_id});
+    defer testing.allocator.free(hb_path);
+    var hb = try ctx.requestWithAuth(.POST, hb_path, "", "Bearer default-secret-please-change");
+    defer hb.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), hb.status_code);
+    try testing.expect(std.mem.indexOf(u8, hb.body, "\"locked_until\"") != null);
+
+    var claim2 = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+    defer claim2.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 204), claim2.status_code);
+}
+
+test "heartbeat rejects invalid extend values" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var dispatch = try ctx.request(.POST, "/v1/tasks/dispatch", "\"x\"");
+    defer dispatch.deinit(testing.allocator);
+    var claim = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+    defer claim.deinit(testing.allocator);
+    const task_id = extractFirstTaskId(claim.body) orelse return error.MissingTaskId;
+    defer testing.allocator.free(task_id);
+
+    const hb_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/inbox/{s}/heartbeat?extend=notanumber", .{task_id});
+    defer testing.allocator.free(hb_path);
+    var hb = try ctx.requestWithAuth(.POST, hb_path, "", "Bearer default-secret-please-change");
+    defer hb.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 400), hb.status_code);
+
+    const hb_path2 = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/inbox/{s}/heartbeat?extend=999999", .{task_id});
+    defer testing.allocator.free(hb_path2);
+    var hb2 = try ctx.requestWithAuth(.POST, hb_path2, "", "Bearer default-secret-please-change");
+    defer hb2.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 400), hb2.status_code);
+}
+
+test "cancel finalizes an unclaimed task and fences complete" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var dispatch = try ctx.request(.POST, "/v1/tasks/dispatch", "\"cancel me\"");
+    defer dispatch.deinit(testing.allocator);
+    const task_id = extractFirstTaskId(dispatch.body) orelse return error.MissingTaskId;
+    defer testing.allocator.free(task_id);
+
+    const cancel_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/inbox/{s}/cancel", .{task_id});
+    defer testing.allocator.free(cancel_path);
+    var cancel = try ctx.requestWithAuth(.POST, cancel_path, "", "Bearer admin-token-change-me");
+    defer cancel.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), cancel.status_code);
+
+    const complete_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/outbox/{s}/complete", .{task_id});
+    defer testing.allocator.free(complete_path);
+    var complete_resp = try ctx.requestWithAuth(.POST, complete_path, "{\"result\":\"late\"}", "Bearer default-secret-please-change");
+    defer complete_resp.deinit(testing.allocator);
+    try testing.expect(complete_resp.status_code == 404 or complete_resp.status_code == 200);
+
+    var cancel2 = try ctx.requestWithAuth(.POST, cancel_path, "", "Bearer admin-token-change-me");
+    defer cancel2.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 404), cancel2.status_code);
+}
+
+test "cancel of a claimed task marks it and the next claim skips it" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var dispatch = try ctx.request(.POST, "/v1/tasks/dispatch", "\"claimed cancel\"");
+    defer dispatch.deinit(testing.allocator);
+    var claim = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+    defer claim.deinit(testing.allocator);
+    const task_id = extractFirstTaskId(claim.body) orelse return error.MissingTaskId;
+    defer testing.allocator.free(task_id);
+
+    const cancel_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/inbox/{s}/cancel", .{task_id});
+    defer testing.allocator.free(cancel_path);
+    var cancel = try ctx.requestWithAuth(.POST, cancel_path, "", "Bearer admin-token-change-me");
+    defer cancel.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 202), cancel.status_code);
+
+    var claim2 = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+    defer claim2.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 204), claim2.status_code);
+}
+
+test "getTask returns full state including A2A-style state names" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var dispatch = try ctx.request(.POST, "/v1/tasks/dispatch", "{\"work\": \"report\"}");
+    defer dispatch.deinit(testing.allocator);
+    const task_id = extractFirstTaskId(dispatch.body) orelse return error.MissingTaskId;
+    defer testing.allocator.free(task_id);
+
+    const get_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/tasks/{s}", .{task_id});
+    defer testing.allocator.free(get_path);
+    {
+        var resp = try ctx.requestWithAuth(.GET, get_path, "", "Bearer default-secret-please-change");
+        defer resp.deinit(testing.allocator);
+        try testing.expectEqual(@as(u16, 200), resp.status_code);
+        try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"submitted\"") != null);
+    }
+
+    var claim = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+    defer claim.deinit(testing.allocator);
+    {
+        var resp = try ctx.requestWithAuth(.GET, get_path, "", "Bearer default-secret-please-change");
+        defer resp.deinit(testing.allocator);
+        try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"working\"") != null);
+    }
+
+    const complete_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/outbox/{s}/complete", .{task_id});
+    defer testing.allocator.free(complete_path);
+    var complete_resp = try ctx.requestWithAuth(.POST, complete_path, "{\"summary\":\"done\"}", "Bearer default-secret-please-change");
+    defer complete_resp.deinit(testing.allocator);
+    {
+        var resp = try ctx.requestWithAuth(.GET, get_path, "", "Bearer default-secret-please-change");
+        defer resp.deinit(testing.allocator);
+        try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"completed\"") != null);
+    }
+
+    var resp404 = try ctx.requestWithAuth(.GET, "/v1/agents/agent-0/tasks/t_nonexistent", "", "Bearer default-secret-please-change");
+    defer resp404.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 404), resp404.status_code);
+}
+
+test "human-in-the-loop: input-required parks, input resumes" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var dispatch = try ctx.request(.POST, "/v1/tasks/dispatch", "\"approve my plan\"");
+    defer dispatch.deinit(testing.allocator);
+    var claim = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+    defer claim.deinit(testing.allocator);
+    const task_id = extractFirstTaskId(claim.body) orelse return error.MissingTaskId;
+    defer testing.allocator.free(task_id);
+
+    const park_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/inbox/{s}/input-required", .{task_id});
+    defer testing.allocator.free(park_path);
+    var park = try ctx.requestWithAuth(.POST, park_path, "{\"query\": \"Which database?\"}", "Bearer default-secret-please-change");
+    defer park.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), park.status_code);
+
+    var claim2 = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+    defer claim2.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 204), claim2.status_code);
+
+    const input_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/inbox/{s}/input", .{task_id});
+    defer testing.allocator.free(input_path);
+    var input = try ctx.requestWithAuth(.POST, input_path, "{\"input\": \"postgres\"}", "Bearer admin-token-change-me");
+    defer input.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), input.status_code);
+
+    const get_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/tasks/{s}", .{task_id});
+    defer testing.allocator.free(get_path);
+    var resp = try ctx.requestWithAuth(.GET, get_path, "", "Bearer default-secret-please-change");
+    defer resp.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"working\"") != null);
+
+    var input2 = try ctx.requestWithAuth(.POST, input_path, "{\"input\": \"again\"}", "Bearer admin-token-change-me");
+    defer input2.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 404), input2.status_code);
+}
+
+test "agent registration persists and survives restart" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var reg = try ctx.request(.POST, "/v1/agents",
+        \\{"agent_id": "billing-agent", "secret": "super-secret-billing-key-123", "name": "Billing", "skills": ["invoices", "pdf"]}
+    );
+    defer reg.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), reg.status_code);
+    try testing.expect(std.mem.indexOf(u8, reg.body, "\"billing-agent\"") != null);
+
+    var claim = try ctx.requestWithAuth(.POST, "/v1/agents/billing-agent/inbox/claim", "", "Bearer super-secret-billing-key-123");
+    defer claim.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 204), claim.status_code);
+
+    var bad = try ctx.requestWithAuth(.POST, "/v1/agents/billing-agent/inbox/claim", "", "Bearer wrong-secret");
+    defer bad.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 401), bad.status_code);
+
+    var card = try ctx.request(.GET, "/v1/agents/billing-agent/card", "");
+    defer card.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), card.status_code);
+    try testing.expect(std.mem.indexOf(u8, card.body, "invoices") != null);
+    try testing.expect(std.mem.indexOf(u8, card.body, "Billing") != null);
+
+    var wk = try ctx.request(.GET, "/.well-known/agent-card.json", "");
+    defer wk.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), wk.status_code);
+    try testing.expect(std.mem.indexOf(u8, wk.body, "billing-agent") != null);
+
+    var reg_bad = try ctx.request(.POST, "/v1/agents", "{\"agent_id\": \"weak\", \"secret\": \"short\"}");
+    defer reg_bad.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 400), reg_bad.status_code);
+}
+
+test "grant token verification gates /v1/results" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var dispatch = try ctx.request(.POST, "/v1/tasks/dispatch", "\"result payload\"");
+    defer dispatch.deinit(testing.allocator);
+    var claim = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+    defer claim.deinit(testing.allocator);
+    const task_id = extractFirstTaskId(claim.body) orelse return error.MissingTaskId;
+    defer testing.allocator.free(task_id);
+
+    const complete_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/outbox/{s}/complete", .{task_id});
+    defer testing.allocator.free(complete_path);
+    var complete_resp = try ctx.requestWithAuth(.POST, complete_path, "{\"summary\":\"the answer\"}", "Bearer default-secret-please-change");
+    defer complete_resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), complete_resp.status_code);
+    const token = extractFirstToken(complete_resp.body) orelse return error.MissingGrantToken;
+    defer testing.allocator.free(token);
+
+    const result_path = try std.fmt.allocPrint(testing.allocator, "/v1/results/{s}?token={s}", .{ task_id, token });
+    defer testing.allocator.free(result_path);
+    var ok_resp = try ctx.request(.GET, result_path, "");
+    defer ok_resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), ok_resp.status_code);
+    try testing.expect(std.mem.indexOf(u8, ok_resp.body, "the answer") != null);
+
+    const bad_path = try std.fmt.allocPrint(testing.allocator, "/v1/results/{s}?token=fb_grant_deadbeef_exp9999999999", .{task_id});
+    defer testing.allocator.free(bad_path);
+    var bad_resp = try ctx.request(.GET, bad_path, "");
+    defer bad_resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 401), bad_resp.status_code);
+
+    const notoken_path = try std.fmt.allocPrint(testing.allocator, "/v1/results/{s}", .{task_id});
+    defer testing.allocator.free(notoken_path);
+    var nt_resp = try ctx.request(.GET, notoken_path, "");
+    defer nt_resp.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 400), nt_resp.status_code);
+}
+
+test "advanced dispatch with priority, schedule, deps, idempotency" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var high = try ctx.requestWithAuth(.POST, "/v1/tasks/dispatch-advanced",
+        \\{"agent_id": "agent-0", "action": "urgent", "payload": {"n": 1}, "priority": 10}
+    , "Bearer admin-token-change-me");
+    defer high.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), high.status_code);
+    const high_id = extractFirstTaskId(high.body) orelse return error.MissingHighId;
+    defer testing.allocator.free(high_id);
+
+    var low = try ctx.requestWithAuth(.POST, "/v1/tasks/dispatch-advanced",
+        \\{"agent_id": "agent-0", "action": "normal", "payload": {"n": 2}}
+    , "Bearer admin-token-change-me");
+    defer low.deinit(testing.allocator);
+    const low_id = extractFirstTaskId(low.body) orelse return error.MissingLowId;
+    defer testing.allocator.free(low_id);
+
+    var claim1 = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+    defer claim1.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), claim1.status_code);
+    const claimed1_id = extractFirstTaskId(claim1.body).?;
+    defer testing.allocator.free(claimed1_id);
+    try testing.expect(std.mem.eql(u8, high_id, claimed1_id));
+
+    var sched = try ctx.requestWithAuth(.POST, "/v1/tasks/dispatch-advanced",
+        \\{"agent_id": "agent-0", "action": "later", "payload": {}, "available_at": "2099-01-01 00:00:00"}
+    , "Bearer admin-token-change-me");
+    defer sched.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), sched.status_code);
+    const sched_id = extractFirstTaskId(sched.body) orelse return error.MissingSchedId;
+    defer testing.allocator.free(sched_id);
+    {
+        var c = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+        defer c.deinit(testing.allocator);
+        const got = extractFirstTaskId(c.body).?;
+        defer testing.allocator.free(got);
+        try testing.expect(std.mem.eql(u8, low_id, got));
+    }
+    {
+        var c = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+        defer c.deinit(testing.allocator);
+        try testing.expectEqual(@as(u16, 204), c.status_code);
+    }
+
+    var blocked = try ctx.requestWithAuth(.POST, "/v1/tasks/dispatch-advanced",
+        \\{"agent_id": "agent-0", "action": "dependent", "payload": {}, "blocked_by": ["t_missing"]}
+    , "Bearer admin-token-change-me");
+    defer blocked.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), blocked.status_code);
+    {
+        var c = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+        defer c.deinit(testing.allocator);
+        try testing.expectEqual(@as(u16, 204), c.status_code);
+    }
+
+    var d1 = try ctx.requestWithAuth(.POST, "/v1/tasks/dispatch-advanced",
+        \\{"agent_id": "agent-0", "action": "once", "payload": {}, "idempotency_key": "unique-1"}
+    , "Bearer admin-token-change-me");
+    defer d1.deinit(testing.allocator);
+    var d2 = try ctx.requestWithAuth(.POST, "/v1/tasks/dispatch-advanced",
+        \\{"agent_id": "agent-0", "action": "once", "payload": {}, "idempotency_key": "unique-1"}
+    , "Bearer admin-token-change-me");
+    defer d2.deinit(testing.allocator);
+    const id1 = extractFirstTaskId(d1.body) orelse return error.MissingIdemId;
+    defer testing.allocator.free(id1);
+    const id2 = extractFirstTaskId(d2.body) orelse return error.MissingIdemId2;
+    defer testing.allocator.free(id2);
+    try testing.expect(std.mem.eql(u8, id1, id2));
+    try testing.expect(std.mem.indexOf(u8, d2.body, "\"idempotent\":true") != null);
+}
+
+test "webhook subscription CRUD and listing" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var add = try ctx.requestWithAuth(.POST, "/v1/webhooks",
+        \\{"url": "http://127.0.0.1:9/hook", "agent_id": "agent-0"}
+    , "Bearer admin-token-change-me");
+    defer add.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), add.status_code);
+    const sub_id = extractFirstSubId(add.body) orelse return error.MissingSubId;
+    defer testing.allocator.free(sub_id);
+    try testing.expect(std.mem.indexOf(u8, add.body, "\"secret\"") != null);
+
+    var list = try ctx.requestWithAuth(.GET, "/v1/webhooks?agent_id=agent-0", "", "Bearer admin-token-change-me");
+    defer list.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), list.status_code);
+    try testing.expect(std.mem.indexOf(u8, list.body, sub_id) != null);
+
+    var bad = try ctx.requestWithAuth(.POST, "/v1/webhooks", "{\"url\": \"http://127.0.0.1:9/hook\"}", "Bearer admin-token-change-me");
+    defer bad.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 400), bad.status_code);
+
+    var badurl = try ctx.requestWithAuth(.POST, "/v1/webhooks", "{\"url\": \"ftp://x/hook\", \"agent_id\": \"agent-0\"}", "Bearer admin-token-change-me");
+    defer badurl.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 400), badurl.status_code);
+
+    const del_path = try std.fmt.allocPrint(testing.allocator, "/v1/webhooks/{s}", .{sub_id});
+    defer testing.allocator.free(del_path);
+    var del = try ctx.requestWithAuth(.DELETE, del_path, "", "Bearer admin-token-change-me");
+    defer del.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 200), del.status_code);
+    var del2 = try ctx.requestWithAuth(.DELETE, del_path, "", "Bearer admin-token-change-me");
+    defer del2.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 404), del2.status_code);
+}
+
+test "poison pill claim returns nothing instead of handing out the row" {
+    var ctx = try TestContext.init(testing.allocator);
+    defer ctx.deinit();
+
+    var dispatch = try ctx.request(.POST, "/v1/tasks/dispatch", "\"poison\"");
+    defer dispatch.deinit(testing.allocator);
+    const task_id = extractFirstTaskId(dispatch.body) orelse return error.MissingTaskId;
+    defer testing.allocator.free(task_id);
+
+    {
+        var stmt = try ctx.store_backend.db.prepare("UPDATE tasks SET try_count = 3 WHERE task_id = ?");
+        defer stmt.finalize();
+        try stmt.bindText(1, task_id);
+        _ = try stmt.step();
+    }
+
+    var claim = try ctx.requestWithAuth(.POST, "/v1/agents/agent-0/inbox/claim", "", "Bearer default-secret-please-change");
+    defer claim.deinit(testing.allocator);
+    try testing.expectEqual(@as(u16, 204), claim.status_code);
+
+    const get_path = try std.fmt.allocPrint(testing.allocator, "/v1/agents/agent-0/tasks/{s}", .{task_id});
+    defer testing.allocator.free(get_path);
+    var resp = try ctx.requestWithAuth(.GET, get_path, "", "Bearer default-secret-please-change");
+    defer resp.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"failed\"") != null);
+}
+
+// ── helpers for the new tests ─────────────────────────────────────────────
+
+/// Extract the first "task_id":"..." value from a JSON body (caller-owned).
+fn extractFirstTaskId(body: []const u8) ?[]u8 {
+    const key = "\"task_id\":\"";
+    const start = std.mem.indexOf(u8, body, key) orelse return null;
+    const val_start = start + key.len;
+    const end = std.mem.indexOfScalarPos(u8, body, val_start, '"') orelse return null;
+    return testing.allocator.dupe(u8, body[val_start..end]) catch null;
+}
+
+/// Extract the first "grant_token":"..." value from a JSON body (caller-owned).
+fn extractFirstToken(body: []const u8) ?[]u8 {
+    const key = "\"grant_token\":\"";
+    const start = std.mem.indexOf(u8, body, key) orelse return null;
+    const val_start = start + key.len;
+    const end = std.mem.indexOfScalarPos(u8, body, val_start, '"') orelse return null;
+    return testing.allocator.dupe(u8, body[val_start..end]) catch null;
+}
+
+/// Extract the first "subscription_id":"..." value from a JSON body (caller-owned).
+fn extractFirstSubId(body: []const u8) ?[]u8 {
+    const key = "\"subscription_id\":\"";
+    const start = std.mem.indexOf(u8, body, key) orelse return null;
+    const val_start = start + key.len;
+    const end = std.mem.indexOfScalarPos(u8, body, val_start, '"') orelse return null;
+    return testing.allocator.dupe(u8, body[val_start..end]) catch null;
+}

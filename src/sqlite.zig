@@ -256,6 +256,12 @@ pub const Stmt = struct {
         if (rc != SQLITE_OK) return error.SqliteBindFailed;
     }
 
+    /// Bind SQL NULL to a parameter.
+    pub fn bindNull(self: *Stmt, idx: c_int) !void {
+        const rc = sqlite3_bind_null(self.handle, idx);
+        if (rc != SQLITE_OK) return error.SqliteBindFailed;
+    }
+
     // ── Column access ─────────────────────────────────────────────────
 
     pub fn columnText(self: *Stmt, idx: c_int) []const u8 {

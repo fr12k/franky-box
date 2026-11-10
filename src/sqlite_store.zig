@@ -35,7 +35,13 @@ pub const SqliteStore = struct {
             \\  locked_until TEXT DEFAULT NULL,
             \\  completed_at TEXT DEFAULT NULL,
             \\  workstream_id TEXT DEFAULT NULL,
-            \\  consumed_at TEXT DEFAULT NULL
+            \\  consumed_at TEXT DEFAULT NULL,
+            \\  priority INTEGER NOT NULL DEFAULT 0,
+            \\  available_at TEXT DEFAULT NULL,
+            \\  blocked_by TEXT DEFAULT NULL,
+            \\  idempotency_key TEXT DEFAULT NULL,
+            \\  pending_input TEXT DEFAULT NULL,
+            \\  cancel_requested INTEGER NOT NULL DEFAULT 0
             \\);
         );
         // Named workstreams — a workstream is a first-class entity with an id,
@@ -58,6 +64,12 @@ pub const SqliteStore = struct {
         // a migration failure instead of swallowing it (every readOutbox/ack/
         // purge query would otherwise fail with a confusing SQL error later).
         try addColumnIfMissing(db, "tasks", "consumed_at", "TEXT DEFAULT NULL");
+        try addColumnIfMissing(db, "tasks", "priority", "INTEGER NOT NULL DEFAULT 0");
+        try addColumnIfMissing(db, "tasks", "available_at", "TEXT DEFAULT NULL");
+        try addColumnIfMissing(db, "tasks", "blocked_by", "TEXT DEFAULT NULL");
+        try addColumnIfMissing(db, "tasks", "idempotency_key", "TEXT DEFAULT NULL");
+        try addColumnIfMissing(db, "tasks", "pending_input", "TEXT DEFAULT NULL");
+        try addColumnIfMissing(db, "tasks", "cancel_requested", "INTEGER NOT NULL DEFAULT 0");
         // Archive table — retired rows (consumed, or aged-out unconsumed) are
         // moved here by purge(). Kept forever; queried by the admin archive view.
         // Same shape as tasks so INSERT ... SELECT ... moves rows verbatim,
@@ -75,9 +87,25 @@ pub const SqliteStore = struct {
             \\  completed_at TEXT DEFAULT NULL,
             \\  consumed_at TEXT DEFAULT NULL,
             \\  workstream_id TEXT DEFAULT NULL,
+            \\  priority INTEGER NOT NULL DEFAULT 0,
+            \\  available_at TEXT DEFAULT NULL,
+            \\  blocked_by TEXT DEFAULT NULL,
+            \\  idempotency_key TEXT DEFAULT NULL,
+            \\  pending_input TEXT DEFAULT NULL,
+            \\  cancel_requested INTEGER NOT NULL DEFAULT 0,
             \\  archived_at TEXT NOT NULL
             \\);
         );
+        try addColumnIfMissing(db, "tasks_archive", "priority", "INTEGER NOT NULL DEFAULT 0");
+        try addColumnIfMissing(db, "tasks_archive", "available_at", "TEXT DEFAULT NULL");
+        try addColumnIfMissing(db, "tasks_archive", "blocked_by", "TEXT DEFAULT NULL");
+        try addColumnIfMissing(db, "tasks_archive", "idempotency_key", "TEXT DEFAULT NULL");
+        try addColumnIfMissing(db, "tasks_archive", "pending_input", "TEXT DEFAULT NULL");
+        try addColumnIfMissing(db, "tasks_archive", "cancel_requested", "INTEGER NOT NULL DEFAULT 0");
+        // The unique idempotency index must ALSO live on the archive: a task
+        // whose key was retired to the archive must not be re-dispatched as new
+        // — findByKey/getTask still find it. (Idempotency is forever.)
+        try db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_archive_idem ON tasks_archive (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL");
         try db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_routing ON tasks (tenant_id, agent_id, output, locked_until)");
         try db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_workstream ON tasks (workstream_id)");
         try db.exec("CREATE INDEX IF NOT EXISTS idx_workstreams_name ON workstreams (name)");
@@ -85,6 +113,39 @@ pub const SqliteStore = struct {
         // keeps it tiny and makes the piggybacked purge cheap forever.
         try db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_completed ON tasks (completed_at) WHERE completed_at IS NOT NULL");
         try db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_consumed ON tasks (consumed_at) WHERE consumed_at IS NOT NULL");
+        // P2: idempotency dedupe (live + archive) and priority-ordered claim.
+        try db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idem ON tasks (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL");
+        try db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_claim ON tasks (tenant_id, agent_id, priority DESC) WHERE output IS NULL");
+
+        // ── P0–P2 additions ─────────────────────────────────────────────
+
+        // Persisted agent registry (P0). Agents registered via the API used to
+        // live only in the Server's in-memory map and vanish on restart.
+        try db.exec(
+            \\CREATE TABLE IF NOT EXISTS agents (
+            \\  agent_id TEXT PRIMARY KEY,
+            \\  secret TEXT NOT NULL,
+            \\  name TEXT,
+            \\  skills TEXT,
+            \\  card_url TEXT,
+            \\  created_at TEXT NOT NULL
+            \\)
+        );
+
+        // Webhook push subscriptions (P1). Scoped to a task (a consumer that
+        // wants one result pushed) or to an agent (every result pushed).
+        try db.exec(
+            \\CREATE TABLE IF NOT EXISTS webhooks (
+            \\  subscription_id TEXT PRIMARY KEY,
+            \\  url TEXT NOT NULL,
+            \\  secret TEXT NOT NULL,
+            \\  task_id TEXT,
+            \\  agent_id TEXT,
+            \\  created_at TEXT NOT NULL
+            \\)
+        );
+        try db.exec("CREATE INDEX IF NOT EXISTS idx_webhooks_task ON webhooks (task_id) WHERE task_id IS NOT NULL");
+        try db.exec("CREATE INDEX IF NOT EXISTS idx_webhooks_agent ON webhooks (agent_id) WHERE agent_id IS NOT NULL");
     }
 
     /// Add a column to a table only if it does not already exist.
@@ -135,8 +196,120 @@ pub const SqliteStore = struct {
         _ = try stmt.step();
     }
 
+    /// Advanced dispatch (P2): priority, scheduling, dependencies, idempotency.
+    ///
+    /// Idempotency: when `options.idempotency_key` matches an existing
+    /// unarchived task in this tenant, no new row is inserted and the id of
+    /// the earlier task is returned (producers may retry safely). The unique
+    /// partial index idx_tasks_idem enforces uniqueness under races.
+    ///
+    /// Dependencies: `options.blocked_by` is stored as a JSON array string.
+    /// Claim only considers tasks whose every dependency has output (i.e. is
+    /// completed OR failed — both are terminal and both unblock the waiter).
+    pub fn dispatchAdvanced(self: *SqliteStore, allocator: std.mem.Allocator, tenant_id: []const u8, agent_id: []const u8, task_id: []const u8, action: []const u8, payload: []const u8, workstream_id: ?[]const u8, options: types.DispatchOptions) ![]const u8 {
+        try self.purge();
+
+        // Idempotency fast-path: same key → return the existing task id.
+        if (options.idempotency_key) |key| {
+            if (key.len > 0) {
+                const existing = try self.findByKey(tenant_id, key);
+                defer if (existing) |e| self.allocator.free(e);
+                if (existing) |task_id_existing| return try allocator.dupe(u8, task_id_existing);
+            }
+        }
+
+        // Serialize blocked_by into a JSON array ("[\"t_a\",\"t_b\"]").
+        var blocked_json: ?[]const u8 = null;
+        defer if (blocked_json) |b| self.allocator.free(b);
+        if (options.blocked_by.len > 0) {
+            blocked_json = try jsonEncodeStringArray(self.allocator, options.blocked_by);
+        }
+
+        const ws: []const u8 = workstream_id orelse task_id;
+        const sql =
+            \\INSERT INTO tasks (tenant_id, agent_id, task_id, action, payload, workstream_id,
+            \\                   priority, available_at, blocked_by, idempotency_key)
+            \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ;
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+        try stmt.bindText(1, tenant_id);
+        try stmt.bindText(2, agent_id);
+        try stmt.bindText(3, task_id);
+        try stmt.bindText(4, action);
+        try stmt.bindText(5, payload);
+        try stmt.bindText(6, ws);
+        try stmt.bindInt(7, options.priority);
+        if (options.available_at) |at| try stmt.bindText(8, at) else try stmt.bindNull(8);
+        if (blocked_json) |b| try stmt.bindText(9, b) else try stmt.bindNull(9);
+        if (options.idempotency_key) |k| try stmt.bindText(10, k) else try stmt.bindNull(10);
+        _ = try stmt.step();
+        return try allocator.dupe(u8, task_id);
+    }
+
+    fn findByKey(self: *SqliteStore, tenant_id: []const u8, key: []const u8) !?[]const u8 {
+        // Idempotency is forever: a task whose key was retired to the
+        // archive must still be found so a re-dispatch returns the original
+        // task instead of creating a duplicate.
+        const sql =
+            \\SELECT task_id FROM tasks WHERE tenant_id = ? AND idempotency_key = ?
+            \\UNION ALL
+            \\SELECT task_id FROM tasks_archive WHERE tenant_id = ? AND idempotency_key = ?
+            \\LIMIT 1;
+        ;
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+        try stmt.bindText(1, tenant_id);
+        try stmt.bindText(2, key);
+        try stmt.bindText(3, tenant_id);
+        try stmt.bindText(4, key);
+        if (try stmt.step()) {
+            return try self.allocator.dupe(u8, stmt.columnText(0));
+        }
+        return null;
+    }
+
+    /// Encode a list of strings as a JSON array (for blocked_by storage).
+    fn jsonEncodeStringArray(allocator: std.mem.Allocator, items: []const []const u8) ![]const u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        try buf.appendSlice(allocator, "[");
+        for (items, 0..) |item, i| {
+            if (i > 0) try buf.appendSlice(allocator, ",");
+            try buf.appendSlice(allocator, "\"");
+            for (item) |c| {
+                switch (c) {
+                    '"' => try buf.appendSlice(allocator, "\\\""),
+                    '\\' => try buf.appendSlice(allocator, "\\\\"),
+                    else => try buf.append(allocator, c),
+                }
+            }
+            try buf.appendSlice(allocator, "\"");
+        }
+        try buf.appendSlice(allocator, "]");
+        return try buf.toOwnedSlice(allocator);
+    }
+
     pub fn claim(self: *SqliteStore, allocator: std.mem.Allocator, tenant_id: []const u8, agent_id: []const u8) !?types.ClaimResult {
         try self.purge();
+        // P1: finalize deferred-cancel rows first. A cancelled-
+        // while-claimed task has cancel_requested=1; the main claim below skips it,
+        // so without this step it would strand in the inbox forever. Here we
+        // write the canceled output (terminal, like a poison pill) and let
+        // the main claim pick the next real candidate.
+        var finalize_stmt = try self.db.prepare(
+            \\UPDATE tasks
+            \\SET output = '{"canceled": true, "reason": "deferred cancel finalized"}',
+            \\    completed_at = strftime('%Y-%m-%d %H:%M:%f', 'now'),
+            \\    locked_until = NULL
+            \\WHERE tenant_id = ? AND agent_id = ?
+            \\  AND output IS NULL AND cancel_requested = 1
+        );
+        defer finalize_stmt.finalize();
+        try finalize_stmt.bindText(1, tenant_id);
+        try finalize_stmt.bindText(2, agent_id);
+        _ = try finalize_stmt.step();
+
         const sql =
             \\UPDATE tasks
             \\SET
@@ -150,7 +323,17 @@ pub const SqliteStore = struct {
             \\     AND agent_id = ?
             \\     AND output IS NULL
             \\     AND (locked_until IS NULL OR datetime(locked_until) <= datetime('now'))
-            \\   ORDER BY rowid ASC
+            \\     AND cancel_requested = 0
+            \\     AND pending_input IS NULL
+            \\     AND (available_at IS NULL OR datetime(available_at) <= datetime('now'))
+            \\     AND NOT EXISTS (
+            \\       SELECT 1 FROM json_each(tasks.blocked_by) AS dep
+            \\       WHERE NOT EXISTS (
+            \\         SELECT 1 FROM tasks AS t2
+            \\         WHERE t2.task_id = dep.value AND t2.output IS NOT NULL
+            \\       )
+            \\     )
+            \\   ORDER BY priority DESC, rowid ASC
             \\   LIMIT 1
             \\)
             \\RETURNING task_id, action, payload, try_count, workstream_id;
@@ -160,12 +343,16 @@ pub const SqliteStore = struct {
         try stmt.bindText(1, tenant_id);
         try stmt.bindText(2, agent_id);
         if (try stmt.step()) {
+            const try_count: i32 = @intCast(stmt.columnInt(3));
+            // Just-poisoned (this claim drove try_count past 3): the row is
+            // already terminal with a poison output — do not hand it out.
+            if (try_count >= 4) return null;
             const ws = stmt.columnText(4);
             return types.ClaimResult{
                 .task_id = try allocator.dupe(u8, stmt.columnText(0)),
                 .action = try allocator.dupe(u8, stmt.columnText(1)),
                 .payload = try allocator.dupe(u8, stmt.columnText(2)),
-                .try_count = @intCast(stmt.columnInt(3)),
+                .try_count = try_count,
                 .workstream_id = if (ws.len > 0) try allocator.dupe(u8, ws) else null,
             };
         }
@@ -192,7 +379,8 @@ pub const SqliteStore = struct {
         const sql =
             \\UPDATE tasks
             \\SET output = ?, completed_at = strftime('%Y-%m-%d %H:%M:%f', 'now'), locked_until = NULL
-            \\WHERE tenant_id = ? AND agent_id = ? AND task_id = ?;
+            \\WHERE tenant_id = ? AND agent_id = ? AND task_id = ?
+            \\  AND cancel_requested = 0;
         ;
         var stmt = try self.db.prepare(sql);
         defer stmt.finalize();
@@ -202,6 +390,222 @@ pub const SqliteStore = struct {
         try stmt.bindText(4, task_id);
         _ = try stmt.step();
         return self.db.changes() > 0;
+    }
+
+    /// Extend the claim lease on a working task (P0 heartbeat).
+    /// A claim is a lease, not ownership: LLM tasks regularly run longer than
+    /// the fixed 300 s visibility timeout, which would silently re-queue the
+    /// task and cause duplicate execution. The worker calls heartbeat
+    /// periodically (e.g. every 60 s) to keep the lease.
+    /// Returns the new locked_until (caller-owned), or null when the task is
+    /// not claimable/working (unknown, already completed/failed, or parked).
+    pub fn heartbeat(self: *SqliteStore, allocator: std.mem.Allocator, tenant_id: []const u8, agent_id: []const u8, task_id: []const u8, extend_seconds: i64) !?[]const u8 {
+        var buf: [64]u8 = undefined;
+        const extend_sql = try std.fmt.bufPrintSentinel(&buf, "+{d} seconds", .{extend_seconds}, 0);
+        const sql =
+            \\UPDATE tasks
+            \\SET locked_until = strftime('%Y-%m-%d %H:%M:%f', 'now', ?)
+            \\WHERE tenant_id = ? AND agent_id = ? AND task_id = ?
+            \\  AND output IS NULL
+            \\  AND pending_input IS NULL
+            \\RETURNING locked_until;
+        ;
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+        try stmt.bindText(1, extend_sql);
+        try stmt.bindText(2, tenant_id);
+        try stmt.bindText(3, agent_id);
+        try stmt.bindText(4, task_id);
+        if (try stmt.step()) {
+            return try allocator.dupe(u8, stmt.columnText(0));
+        }
+        return null;
+    }
+
+    /// Cancel a task (P1). Works in two situations:
+    ///   - unclaimed or lease-expired: the row is finalized immediately with
+    ///     a canceled output (terminal, like a failure);
+    ///   - currently claimed (lease held): cancel_requested is set; the next
+    ///     claim pass finalizes it, and the running worker's complete/fail is
+    ///     rejected (terminal state wins — complete/fail check cancel first
+    ///     via the same WHERE guard used here).
+    /// Returns true for the immediate finalize (truly terminal now);
+    /// returns false for the deferred mark (cancelled-while-claimed; the next
+    /// claim pass finalizes it). The caller must not emit a terminal
+    /// webhook notification on the false path.
+    pub fn cancel(self: *SqliteStore, tenant_id: []const u8, agent_id: []const u8, task_id: []const u8, reason: []const u8) !bool {
+        // 1. Immediate path: unclaimed or lease-expired.
+        const sql_now =
+            \\UPDATE tasks
+            \\SET output = ?, completed_at = strftime('%Y-%m-%d %H:%M:%f', 'now'), locked_until = NULL, cancel_requested = 1
+            \\WHERE tenant_id = ? AND agent_id = ? AND task_id = ?
+            \\  AND output IS NULL
+            \\  AND (locked_until IS NULL OR datetime(locked_until) <= datetime('now'));
+        ;
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        try buf.appendSlice(self.allocator, "{\"canceled\": true, \"reason\": ");
+        try jsonStringAppend(&buf, self.allocator, reason);
+        try buf.appendSlice(self.allocator, "}");
+        {
+            var stmt = try self.db.prepare(sql_now);
+            defer stmt.finalize();
+            try stmt.bindText(1, buf.items);
+            try stmt.bindText(2, tenant_id);
+            try stmt.bindText(3, agent_id);
+            try stmt.bindText(4, task_id);
+            _ = try stmt.step();
+            if (self.db.changes() > 0) return true;
+        }
+        // 2. Deferred path: currently claimed — mark for the next pass.
+        // Returns FALSE: the task is not terminal yet (output still NULL); the
+        // caller must not emit a terminal webhook notification now —
+        // `claim()` finalizes it on the next poll and the box emits the
+        // webhook from there via the complete/fail path... except `claim`
+        // finalizes with a canceled output directly, so we emit there.
+        const sql_mark =
+            \\UPDATE tasks SET cancel_requested = 1
+            \\WHERE tenant_id = ? AND agent_id = ? AND task_id = ?
+            \\  AND output IS NULL AND cancel_requested = 0;
+        ;
+        var stmt = try self.db.prepare(sql_mark);
+        defer stmt.finalize();
+        try stmt.bindText(1, tenant_id);
+        try stmt.bindText(2, agent_id);
+        try stmt.bindText(3, task_id);
+        _ = try stmt.step();
+        // Marked (not terminal yet) — return false (accepted-pending). The
+        // caller returns 202; the terminal webhook is emitted lazily when
+        // `claim` finalizes the row (the consumer's next getTask poll
+        // shows the terminal `canceled` state). Documented trade-off.
+        return false;
+    }
+
+    /// Get a single task by id (P1: GetTask). Returns the full row state
+    /// regardless of lifecycle stage. Caller owns the result.
+    pub fn getTask(self: *SqliteStore, allocator: std.mem.Allocator, tenant_id: []const u8, agent_id: []const u8, task_id: []const u8) !?types.Task {
+        const sql =
+            \\SELECT tenant_id, agent_id, task_id, action, payload, output, try_count,
+            \\       locked_until, completed_at, workstream_id,
+            \\       priority, available_at, blocked_by, idempotency_key, pending_input, cancel_requested
+            \\FROM tasks
+            \\WHERE tenant_id = ? AND agent_id = ? AND task_id = ?
+            \\UNION ALL
+            \\SELECT tenant_id, agent_id, task_id, action, payload, output, try_count,
+            \\       locked_until, completed_at, workstream_id,
+            \\       priority, available_at, blocked_by, idempotency_key, pending_input, cancel_requested
+            \\FROM tasks_archive
+            \\WHERE tenant_id = ? AND agent_id = ? AND task_id = ?
+            \\LIMIT 1;
+        ;
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+        try stmt.bindText(1, tenant_id);
+        try stmt.bindText(2, agent_id);
+        try stmt.bindText(3, task_id);
+        try stmt.bindText(4, tenant_id);
+        try stmt.bindText(5, agent_id);
+        try stmt.bindText(6, task_id);
+        if (try stmt.step()) {
+            return types.Task{
+                .tenant_id = try allocator.dupe(u8, stmt.columnText(0)),
+                .agent_id = try allocator.dupe(u8, stmt.columnText(1)),
+                .task_id = try allocator.dupe(u8, stmt.columnText(2)),
+                .action = try allocator.dupe(u8, stmt.columnText(3)),
+                .payload = try allocator.dupe(u8, stmt.columnText(4)),
+                .output = if (stmt.columnIsNull(5)) null else try allocator.dupe(u8, stmt.columnText(5)),
+                .try_count = @intCast(stmt.columnInt(6)),
+                .locked_until = if (stmt.columnIsNull(7)) null else try allocator.dupe(u8, stmt.columnText(7)),
+                .completed_at = if (stmt.columnIsNull(8)) null else try allocator.dupe(u8, stmt.columnText(8)),
+                .workstream_id = if (stmt.columnIsNull(9)) null else try allocator.dupe(u8, stmt.columnText(9)),
+                // P2 fields (fetched by the SELECT, now exposed via types.Task).
+                .priority = @intCast(stmt.columnInt(10)),
+                .available_at = if (stmt.columnIsNull(11)) null else try allocator.dupe(u8, stmt.columnText(11)),
+                .blocked_by = if (stmt.columnIsNull(12)) null else try allocator.dupe(u8, stmt.columnText(12)),
+                .idempotency_key = if (stmt.columnIsNull(13)) null else try allocator.dupe(u8, stmt.columnText(13)),
+                .pending_input = if (stmt.columnIsNull(14)) null else try allocator.dupe(u8, stmt.columnText(14)),
+                .cancel_requested = stmt.columnInt(15) != 0,
+            };
+        }
+        return null;
+    }
+
+    /// Park a working task in the human-in-the-loop state (P2): release the
+    /// lease, record the input query. The next claim pass will not hand the
+    /// task out (pending_input IS NOT NULL blocks candidacy) until
+    /// provideInput re-locks it for the same agent.
+    pub fn requestInput(self: *SqliteStore, tenant_id: []const u8, agent_id: []const u8, task_id: []const u8, query: []const u8) !bool {
+        const sql =
+            \\UPDATE tasks
+            \\SET pending_input = ?, locked_until = NULL
+            \\WHERE tenant_id = ? AND agent_id = ? AND task_id = ?
+            \\  AND output IS NULL AND pending_input IS NULL;
+        ;
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        try buf.appendSlice(self.allocator, "{\"query\": ");
+        try jsonStringAppend(&buf, self.allocator, query);
+        try buf.appendSlice(self.allocator, "}");
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+        try stmt.bindText(1, buf.items);
+        try stmt.bindText(2, tenant_id);
+        try stmt.bindText(3, agent_id);
+        try stmt.bindText(4, task_id);
+        _ = try stmt.step();
+        return self.db.changes() > 0;
+    }
+
+    /// Deliver input to a parked task (P2): consume the pending query, re-lock
+    /// the lease, and append the input to the task payload (delimited) so the
+    /// worker sees it on its next look at the task. The task is re-locked for
+    /// the SAME agent that parked it; a competing worker could also pick it
+    /// up after the lease expires — by design, crash-recovery wins.
+    /// Returns a caller-owned echo of the delivered input, or null when the
+    /// task is not parked.
+    pub fn provideInput(self: *SqliteStore, allocator: std.mem.Allocator, tenant_id: []const u8, agent_id: []const u8, task_id: []const u8, input: []const u8) !?[]const u8 {
+        const sql =
+            \\UPDATE tasks
+            \\SET pending_input = NULL,
+            \\    locked_until = strftime('%Y-%m-%d %H:%M:%f', 'now', '+300 seconds'),
+            \\    payload = payload || '\n---human-input---\n' || ?
+            \\WHERE tenant_id = ? AND agent_id = ? AND task_id = ?
+            \\  AND output IS NULL AND pending_input IS NOT NULL
+        ;
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+        try stmt.bindText(1, input);
+        try stmt.bindText(2, tenant_id);
+        try stmt.bindText(3, agent_id);
+        try stmt.bindText(4, task_id);
+        _ = try stmt.step();
+        if (self.db.changes() > 0) {
+            return try allocator.dupe(u8, input);
+        }
+        return null;
+    }
+
+    /// Append a string to buf as a JSON-escaped string value (no surrounding
+    /// braces) — helper for building small JSON outputs in store code.
+    fn jsonStringAppend(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
+        try buf.appendSlice(allocator, "\"");
+        for (value) |c| {
+            switch (c) {
+                '"' => try buf.appendSlice(allocator, "\\\""),
+                '\\' => try buf.appendSlice(allocator, "\\\\"),
+                '\n' => try buf.appendSlice(allocator, "\\n"),
+                '\r' => try buf.appendSlice(allocator, "\\r"),
+                '\t' => try buf.appendSlice(allocator, "\\t"),
+                else => {
+                    if (c < 0x20) {
+                        try buf.print(allocator, "\\u{x:0>4}", .{c});
+                    } else {
+                        try buf.append(allocator, c);
+                    }
+                },
+            }
+        }
+        try buf.appendSlice(allocator, "\"");
     }
 
     /// Read the agent's unconsumed results completed strictly after
@@ -525,6 +929,124 @@ pub const SqliteStore = struct {
         return null;
     }
 
+    // ── Agent registry (P0: persisted) ────────────────────────────────────────────
+
+    /// Create or update an agent registration.
+    pub fn upsertAgent(self: *SqliteStore, agent_id: []const u8, secret: []const u8, name: ?[]const u8, skills: ?[]const u8, card_url: ?[]const u8) !void {
+        const created_at = try self.now(self.allocator);
+        defer self.allocator.free(created_at);
+        const sql =
+            \\INSERT INTO agents (agent_id, secret, name, skills, card_url, created_at)
+            \\VALUES (?, ?, ?, ?, ?, ?)
+            \\ON CONFLICT(agent_id) DO UPDATE SET
+            \\  secret = excluded.secret,
+            \\  name = COALESCE(excluded.name, agents.name),
+            \\  skills = COALESCE(excluded.skills, agents.skills),
+            \\  card_url = COALESCE(excluded.card_url, agents.card_url)
+        ;
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+        try stmt.bindText(1, agent_id);
+        try stmt.bindText(2, secret);
+        if (name) |n| try stmt.bindText(3, n) else try stmt.bindNull(3);
+        if (skills) |sk| try stmt.bindText(4, sk) else try stmt.bindNull(4);
+        if (card_url) |cu| try stmt.bindText(5, cu) else try stmt.bindNull(5);
+        try stmt.bindText(6, created_at);
+        _ = try stmt.step();
+    }
+
+    /// Look up an agent's secret. Returns null when not registered.
+    pub fn getAgentSecret(self: *SqliteStore, allocator: std.mem.Allocator, agent_id: []const u8) !?[]u8 {
+        var stmt = try self.db.prepare("SELECT secret FROM agents WHERE agent_id = ?");
+        defer stmt.finalize();
+        try stmt.bindText(1, agent_id);
+        if (try stmt.step()) return try allocator.dupe(u8, stmt.columnText(0));
+        return null;
+    }
+
+    /// List all registered agents (admin). Caller owns the slice + records.
+    pub fn listAgents(self: *SqliteStore, allocator: std.mem.Allocator) ![]types.AgentRecord {
+        const sql = "SELECT agent_id, secret, name, skills, card_url, created_at FROM agents ORDER BY created_at ASC, agent_id ASC";
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+        var results: std.ArrayList(types.AgentRecord) = .empty;
+        defer results.deinit(allocator);
+        while (try stmt.step()) {
+            try results.append(allocator, .{
+                .agent_id = try allocator.dupe(u8, stmt.columnText(0)),
+                .secret = try allocator.dupe(u8, stmt.columnText(1)),
+                .name = if (stmt.columnIsNull(2)) null else try allocator.dupe(u8, stmt.columnText(2)),
+                .skills = if (stmt.columnIsNull(3)) null else try allocator.dupe(u8, stmt.columnText(3)),
+                .card_url = if (stmt.columnIsNull(4)) null else try allocator.dupe(u8, stmt.columnText(4)),
+                .created_at = try allocator.dupe(u8, stmt.columnText(5)),
+            });
+        }
+        return try results.toOwnedSlice(allocator);
+    }
+
+    // ── Webhook subscriptions (P1: push) ───────────────────────────────────────────
+
+    /// Register a webhook subscription (task- or agent-scoped).
+    pub fn addWebhook(self: *SqliteStore, subscription_id: []const u8, url: []const u8, secret: []const u8, task_id: ?[]const u8, agent_id: ?[]const u8) !void {
+        const created_at = try self.now(self.allocator);
+        defer self.allocator.free(created_at);
+        const sql =
+            \\INSERT INTO webhooks (subscription_id, url, secret, task_id, agent_id, created_at)
+            \\VALUES (?, ?, ?, ?, ?, ?)
+            \\ON CONFLICT(subscription_id) DO UPDATE SET
+            \\  url = excluded.url, secret = excluded.secret,
+            \\  task_id = excluded.task_id, agent_id = excluded.agent_id
+        ;
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+        try stmt.bindText(1, subscription_id);
+        try stmt.bindText(2, url);
+        try stmt.bindText(3, secret);
+        if (task_id) |t| try stmt.bindText(4, t) else try stmt.bindNull(4);
+        if (agent_id) |a| try stmt.bindText(5, a) else try stmt.bindNull(5);
+        try stmt.bindText(6, created_at);
+        _ = try stmt.step();
+    }
+
+    /// List webhook subscriptions matching a task and/or agent.
+    pub fn listWebhooks(self: *SqliteStore, allocator: std.mem.Allocator, task_id: ?[]const u8, agent_id: ?[]const u8) ![]types.WebhookSubscription {
+        const sql =
+            \\SELECT subscription_id, url, secret, task_id, agent_id, created_at
+            \\FROM webhooks
+            \\WHERE (? IS NULL OR task_id = ?)
+            \\  AND (? IS NULL OR agent_id = ?)
+            \\ORDER BY created_at ASC
+        ;
+        var stmt = try self.db.prepare(sql);
+        defer stmt.finalize();
+        if (task_id) |t| try stmt.bindText(1, t) else try stmt.bindNull(1);
+        if (task_id) |t| try stmt.bindText(2, t) else try stmt.bindNull(2);
+        if (agent_id) |a| try stmt.bindText(3, a) else try stmt.bindNull(3);
+        if (agent_id) |a| try stmt.bindText(4, a) else try stmt.bindNull(4);
+        var results: std.ArrayList(types.WebhookSubscription) = .empty;
+        defer results.deinit(allocator);
+        while (try stmt.step()) {
+            try results.append(allocator, .{
+                .subscription_id = try allocator.dupe(u8, stmt.columnText(0)),
+                .url = try allocator.dupe(u8, stmt.columnText(1)),
+                .secret = try allocator.dupe(u8, stmt.columnText(2)),
+                .task_id = if (stmt.columnIsNull(3)) null else try allocator.dupe(u8, stmt.columnText(3)),
+                .agent_id = if (stmt.columnIsNull(4)) null else try allocator.dupe(u8, stmt.columnText(4)),
+                .created_at = try allocator.dupe(u8, stmt.columnText(5)),
+            });
+        }
+        return try results.toOwnedSlice(allocator);
+    }
+
+    /// Delete a webhook subscription. Returns false when unknown.
+    pub fn deleteWebhook(self: *SqliteStore, subscription_id: []const u8) !bool {
+        var stmt = try self.db.prepare("DELETE FROM webhooks WHERE subscription_id = ?");
+        defer stmt.finalize();
+        try stmt.bindText(1, subscription_id);
+        _ = try stmt.step();
+        return self.db.changes() > 0;
+    }
+
     /// Current UTC timestamp as an ISO8601 string (caller-owned).
     fn now(self: *SqliteStore, allocator: std.mem.Allocator) ![]u8 {
         var stmt = try self.db.prepare("SELECT strftime('%Y-%m-%d %H:%M:%S', 'now')");
@@ -556,6 +1078,18 @@ pub const SqliteStore = struct {
         .createWorkstream = struct { fn f(ctx: *anyopaque, id: []const u8, n: []const u8) anyerror!void { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.createWorkstream(id, n); } }.f,
         .lookupWorkstreamById = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator, id: []const u8) anyerror!?[]u8 { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.lookupWorkstreamById(a, id); } }.f,
         .lookupWorkstreamByName = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator, n: []const u8) anyerror!?[]u8 { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.lookupWorkstreamByName(a, n); } }.f,
+        .dispatchAdvanced = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator, t: []const u8, ag: []const u8, i: []const u8, c: []const u8, p: []const u8, ws: ?[]const u8, o: types.DispatchOptions) anyerror![]const u8 { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.dispatchAdvanced(a, t, ag, i, c, p, ws, o); } }.f,
+        .heartbeat = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator, t: []const u8, ag: []const u8, i: []const u8, e: i64) anyerror!?[]const u8 { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.heartbeat(a, t, ag, i, e); } }.f,
+        .cancel = struct { fn f(ctx: *anyopaque, t: []const u8, ag: []const u8, i: []const u8, r: []const u8) anyerror!bool { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.cancel(t, ag, i, r); } }.f,
+        .getTask = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator, t: []const u8, ag: []const u8, i: []const u8) anyerror!?types.Task { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.getTask(a, t, ag, i); } }.f,
+        .requestInput = struct { fn f(ctx: *anyopaque, t: []const u8, ag: []const u8, i: []const u8, q: []const u8) anyerror!bool { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.requestInput(t, ag, i, q); } }.f,
+        .provideInput = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator, t: []const u8, ag: []const u8, i: []const u8, inp: []const u8) anyerror!?[]const u8 { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.provideInput(a, t, ag, i, inp); } }.f,
+        .upsertAgent = struct { fn f(ctx: *anyopaque, id: []const u8, sec: []const u8, n: ?[]const u8, sk: ?[]const u8, cu: ?[]const u8) anyerror!void { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.upsertAgent(id, sec, n, sk, cu); } }.f,
+        .getAgentSecret = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator, id: []const u8) anyerror!?[]u8 { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.getAgentSecret(a, id); } }.f,
+        .listAgents = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator) anyerror![]types.AgentRecord { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.listAgents(a); } }.f,
+        .addWebhook = struct { fn f(ctx: *anyopaque, id: []const u8, u: []const u8, sec: []const u8, t: ?[]const u8, ag: ?[]const u8) anyerror!void { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.addWebhook(id, u, sec, t, ag); } }.f,
+        .listWebhooks = struct { fn f(ctx: *anyopaque, a: std.mem.Allocator, t: ?[]const u8, ag: ?[]const u8) anyerror![]types.WebhookSubscription { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.listWebhooks(a, t, ag); } }.f,
+        .deleteWebhook = struct { fn f(ctx: *anyopaque, id: []const u8) anyerror!bool { var s: *SqliteStore = @ptrCast(@alignCast(ctx)); return s.deleteWebhook(id); } }.f,
     };
 };
 
