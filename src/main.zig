@@ -49,6 +49,9 @@ pub fn main(init: std.process.Init) !void {
     var api = franky.Server.init(allocator, io, &ts);
     defer api.deinit();
     try api.registerDefaultAgent();
+    // P0: rebuild the in-memory auth cache from the persisted agents table
+    // (registrations now survive restarts).
+    try api.loadAgents();
 
     const address = try net.IpAddress.parseIp4("0.0.0.0", port);
     var tcp_server = try address.listen(io, .{ .reuse_address = true, .kernel_backlog = 128 });

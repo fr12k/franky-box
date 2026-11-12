@@ -49,6 +49,28 @@ pub fn deinit(self: *BoxClient) void {
     self.client.deinit();
 }
 
+/// Append `value` to `buf` as a JSON-escaped string (contents only, no
+/// surrounding quotes). Used by requestInput/cancel to build
+/// safe JSON bodies without pulling in a full JSON writer.
+fn jsonEscapeAppend(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
+    for (value) |c| {
+        switch (c) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            else => {
+                if (c < 0x20) {
+                    try buf.print(allocator, "\\u{x:0>4}", .{c});
+                } else {
+                    try buf.append(allocator, c);
+                }
+            },
+        }
+    }
+}
+
 // ── URL helpers ──────────────────────────────────────────────
 
 fn registerUrl(self: *BoxClient, allocator: std.mem.Allocator) ![]const u8 {
@@ -140,7 +162,7 @@ pub fn register(self: *BoxClient) ![]const u8 {
     };
 
     if (result.status != .ok) return error.RequestFailed;
-    return body_writer.writer.buffered();
+    return self.allocator.dupe(u8, body_writer.writer.buffered()) catch return error.RequestFailed;
 }
 
 /// Dispatch a task (admin endpoint).
@@ -170,7 +192,7 @@ pub fn dispatch(self: *BoxClient, action: []const u8, payload: []const u8) ![]co
     };
 
     if (result.status != .ok) return error.RequestFailed;
-    return body_writer.writer.buffered();
+    return self.allocator.dupe(u8, body_writer.writer.buffered()) catch return error.RequestFailed;
 }
 
 /// Claim the next available task. Returns `null` when no tasks are available (HTTP 204).
@@ -313,7 +335,7 @@ pub fn readOutbox(self: *BoxClient, since: ?[]const u8) ![]const u8 {
     };
 
     if (result.status != .ok) return error.RequestFailed;
-    return body_writer.writer.buffered();
+    return self.allocator.dupe(u8, body_writer.writer.buffered()) catch return error.RequestFailed;
 }
 
 /// Get a result by task ID (requires a grant token from the complete response).
@@ -335,5 +357,118 @@ pub fn getResult(self: *BoxClient, task_id: []const u8, token: []const u8) ![]co
     };
 
     if (result.status != .ok) return error.RequestFailed;
-    return body_writer.writer.buffered();
+    return self.allocator.dupe(u8, body_writer.writer.buffered()) catch return error.RequestFailed;
+}
+
+// ── P0-P2 additions ───────────────────────────────────────────────────
+
+/// Extend the claim lease (heartbeat) so a long-running task is not re-queued.
+/// `extend_seconds` defaults to 300 on the server when null.
+pub fn heartbeat(self: *BoxClient, task_id: []const u8, extend_seconds: ?i64) ![]const u8 {
+    const url = if (extend_seconds) |e|
+        try std.fmt.allocPrint(self.allocator, "{s}/v1/agents/{s}/inbox/{s}/heartbeat?extend={d}", .{ self.base_url, self.agent_id, task_id, e })
+    else
+        try std.fmt.allocPrint(self.allocator, "{s}/v1/agents/{s}/inbox/{s}/heartbeat", .{ self.base_url, self.agent_id, task_id });
+    defer self.allocator.free(url);
+    var body_writer = std.Io.Writer.Allocating.init(self.allocator);
+    defer body_writer.deinit();
+    const result = self.client.fetch(.{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = "",
+        .response_writer = &body_writer.writer,
+        .extra_headers = &self.headers,
+    }) catch {
+        return error.RequestFailed;
+    };
+    if (result.status != .ok and result.status != .no_content) return error.RequestFailed;
+    return self.allocator.dupe(u8, body_writer.writer.buffered()) catch return error.RequestFailed;
+}
+
+/// Cancel a task (agent or producer/admin auth). Returns the response JSON.
+pub fn cancel(self: *BoxClient, task_id: []const u8, reason: []const u8) ![]const u8 {
+    const url = try std.fmt.allocPrint(self.allocator, "{s}/v1/agents/{s}/inbox/{s}/cancel", .{ self.base_url, self.agent_id, task_id });
+    defer self.allocator.free(url);
+    // Build a JSON body {"reason":"<escaped>"} so the server reads the reason
+    // (was: raw text, which the server's jsonStringField ignored, falling back to default).
+    var body_buf: std.ArrayList(u8) = .empty;
+    defer body_buf.deinit(self.allocator);
+    try body_buf.appendSlice(self.allocator, "{\"reason\":\"");
+    try jsonEscapeAppend(&body_buf, self.allocator, reason);
+    try body_buf.appendSlice(self.allocator, "\"}");
+    var body_writer = std.Io.Writer.Allocating.init(self.allocator);
+    defer body_writer.deinit();
+    const result = self.client.fetch(.{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = body_buf.items,
+        .response_writer = &body_writer.writer,
+        .extra_headers = &self.headers,
+    }) catch {
+        return error.RequestFailed;
+    };
+    // Deferred cancel now returns 202 Accepted; accept both 200 and 202.
+    if (result.status != .ok and result.status != .accepted) return error.RequestFailed;
+    return self.allocator.dupe(u8, body_writer.writer.buffered()) catch return error.RequestFailed;
+}
+
+/// Get a task's full state (A2A-style state names in the response).
+pub fn getTask(self: *BoxClient, task_id: []const u8) ![]const u8 {
+    const url = try std.fmt.allocPrint(self.allocator, "{s}/v1/agents/{s}/tasks/{s}", .{ self.base_url, self.agent_id, task_id });
+    defer self.allocator.free(url);
+    var body_writer = std.Io.Writer.Allocating.init(self.allocator);
+    defer body_writer.deinit();
+    const result = self.client.fetch(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .response_writer = &body_writer.writer,
+        .extra_headers = &self.headers,
+    }) catch {
+        return error.RequestFailed;
+    };
+    if (result.status != .ok) return error.RequestFailed;
+    return self.allocator.dupe(u8, body_writer.writer.buffered()) catch return error.RequestFailed;
+}
+
+/// Park the current task and ask for human/producer input.
+pub fn requestInput(self: *BoxClient, task_id: []const u8, query: []const u8) ![]const u8 {
+    const url = try std.fmt.allocPrint(self.allocator, "{s}/v1/agents/{s}/inbox/{s}/input-required", .{ self.base_url, self.agent_id, task_id });
+    defer self.allocator.free(url);
+    // Build a JSON body with the query escaped (was: allocPrint without
+    // escaping, producing malformed JSON when query contains quotes/backslashes).
+    var body_buf: std.ArrayList(u8) = .empty;
+    defer body_buf.deinit(self.allocator);
+    try body_buf.appendSlice(self.allocator, "{\"query\":\"");
+    try jsonEscapeAppend(&body_buf, self.allocator, query);
+    try body_buf.appendSlice(self.allocator, "\"}");
+    var body_writer = std.Io.Writer.Allocating.init(self.allocator);
+    defer body_writer.deinit();
+    const result = self.client.fetch(.{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = body_buf.items,
+        .response_writer = &body_writer.writer,
+        .extra_headers = &self.headers,
+    }) catch {
+        return error.RequestFailed;
+    };
+    if (result.status != .ok) return error.RequestFailed;
+    return self.allocator.dupe(u8, body_writer.writer.buffered()) catch return error.RequestFailed;
+}
+
+/// Fetch the box's well-known Agent Card (public, no auth needed).
+pub fn wellKnownCard(self: *BoxClient) ![]const u8 {
+    const url = try std.fmt.allocPrint(self.allocator, "{s}/.well-known/agent-card.json", .{self.base_url});
+    defer self.allocator.free(url);
+    var body_writer = std.Io.Writer.Allocating.init(self.allocator);
+    defer body_writer.deinit();
+    const result = self.client.fetch(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .response_writer = &body_writer.writer,
+    }) catch {
+        return error.RequestFailed;
+    };
+    if (result.status != .ok) return error.RequestFailed;
+    return self.allocator.dupe(u8, body_writer.writer.buffered()) catch return error.RequestFailed;
 }

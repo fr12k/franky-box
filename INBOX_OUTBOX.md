@@ -1,5 +1,13 @@
 # Simplifed version (v0)
 
+> **Status (2026-11-08):** This is the original v0 design document. It is **implemented**
+> with these deltas: §D's 7-day hard purge was replaced by the retention/ack model (see
+> `RETENTION.md`); §2's shortest-queue central routing is **designed but not implemented**
+> (dispatch targets an explicit agent); poison-pill claims no longer hand the poisoned row
+> to the agent (it returns 204); and the schema has since grown P0–P2 columns (priority,
+> available_at, blocked_by, idempotency_key, pending_input, cancel_requested) plus agents
+> and webhooks tables — see `README.md` for the current API.
+
 To make franky-box radically simple, hyper-reliable, and bulletproof on SQLite, we can strip away everything that forces us to manage complex state, multi-step queries, or background cron workers.
 Here is exactly what we can cut, how it simplifies the architecture, and the streamlined design that remains.
 What We Can Drastically Simplify or Remove
@@ -130,8 +138,6 @@ Why this is fundamentally more reliable:
 Zero Distributed State Risk: There is no scenario where a task is marked done in the inbox but fails to write to the outbox. The write is a single row edit.
 Fewer Lines of Code: Stripping out state changes makes testing simple.
 Perfect for SQLite: SQLite thrives on single-table constraints, which eliminates row-locking contention issues entirely. [1]
-If you are satisfied with this hyper-lean version, let me know:
-Should we write a minimal 30-line Python implementation of the server routes to show how simple it is?
-Should we detail how the agent client side loops backoff when the API returns nothing?
+*The trailing design-discussion questions from the original doc were removed (2026-11-08).*
 
 [1] https://news.ycombinator.com

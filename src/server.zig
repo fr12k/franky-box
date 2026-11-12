@@ -9,6 +9,7 @@ const types = @import("types.zig");
 const task_store = @import("store.zig");
 const authn = @import("auth.zig");
 const uuid = @import("uuid.zig");
+const webhook = @import("webhook.zig");
 const build_options = @import("build_options");
 
 /// Admin API token – set via env var `FRANKY_BOX_ADMIN_TOKEN` or default.
@@ -28,6 +29,10 @@ allocator: std.mem.Allocator,
 io: std.Io,
 store: *task_store.TaskStore,
 agents: std.StringHashMap([]const u8),
+/// P1: webhook deliveries are performed inline (synchronously) but never
+/// block or fail the triggering request — delivery errors are logged only.
+/// Each delivery is best-effort with a short connect timeout.
+webhook_timeout_ms: u64 = 3000,
 
 pub const Server = @This();
 
@@ -105,6 +110,42 @@ pub fn handleWithPath(self: *Server, req: *http.Server.Request, path_with_query:
         return self.handleDispatch(req, body);
     }
 
+    // P2: advanced dispatch — priority, schedule, dependencies, idempotency.
+    // POST /v1/tasks/dispatch-advanced (admin/producer; JSON body)
+    if (segments.len == 3 and isSeg(segments[0], "v1") and isSeg(segments[1], "tasks") and isSeg(segments[2], "dispatch-advanced")) {
+        if (method != .POST) return errJson(a, req, .method_not_allowed, "method not allowed");
+        if (!requireAdmin(req)) return errJson(a, req, .unauthorized, "unauthorized");
+        return self.handleDispatchAdvanced(req, body);
+    }
+
+    // P1: A2A-style Agent Card — the box's own card, listing registered agents.
+    // GET /.well-known/agent-card.json
+    if (segments.len == 2 and isSeg(segments[0], ".well-known") and isSeg(segments[1], "agent-card.json")) {
+        if (method != .GET) return errJson(a, req, .method_not_allowed, "method not allowed");
+        return self.handleWellKnownCard(req);
+    }
+
+    // P1: webhook subscription management (A2A push-notification config analog).
+    // POST   /v1/webhooks            register (JSON: url, task_id?/agent_id?)
+    // GET    /v1/webhooks            list (?task_id=?&agent_id=?)
+    // DELETE /v1/webhooks/{sub_id}  delete
+    if (segments.len == 2 and isSeg(segments[0], "v1") and isSeg(segments[1], "webhooks")) {
+        if (method == .POST) {
+            if (!requireAdmin(req)) return errJson(a, req, .unauthorized, "unauthorized");
+            return self.handleAddWebhook(req, body);
+        }
+        if (method == .GET) {
+            if (!requireAdmin(req)) return errJson(a, req, .unauthorized, "unauthorized");
+            return self.handleListWebhooks(req);
+        }
+        return errJson(a, req, .method_not_allowed, "method not allowed");
+    }
+    if (segments.len == 3 and isSeg(segments[0], "v1") and isSeg(segments[1], "webhooks")) {
+        if (method != .DELETE) return errJson(a, req, .method_not_allowed, "method not allowed");
+        if (!requireAdmin(req)) return errJson(a, req, .unauthorized, "unauthorized");
+        return self.handleDeleteWebhook(req, segments[2]);
+    }
+
     if (segments.len >= 3 and isSeg(segments[0], "v1") and isSeg(segments[1], "agents")) {
         const agent = segments[2];
 
@@ -112,6 +153,39 @@ pub fn handleWithPath(self: *Server, req: *http.Server.Request, path_with_query:
             if (method != .POST) return errJson(a, req, .method_not_allowed, "method not allowed");
             if (!self.requireAgent(agent, req)) return errJson(a, req, .unauthorized, "unauthorized");
             return self.handleClaim(req, agent);
+        }
+
+        // P0: lease heartbeat — extend the claim's visibility timeout.
+        // POST /v1/agents/{id}/inbox/{task}/heartbeat  (optional ?extend=N seconds)
+        if (segments.len >= 6 and isSeg(segments[3], "inbox") and isSeg(segments[5], "heartbeat")) {
+            if (method != .POST) return errJson(a, req, .method_not_allowed, "method not allowed");
+            if (!self.requireAgent(agent, req)) return errJson(a, req, .unauthorized, "unauthorized");
+            return self.handleHeartbeat(req, agent, segments[4]);
+        }
+
+        // P2: human-in-the-loop — park the task and ask for input, or deliver it.
+        // POST /v1/agents/{id}/inbox/{task}/input-required  (body: {"query": "..."})
+        // POST /v1/agents/{id}/inbox/{task}/input           (body: raw input text)
+        if (segments.len >= 6 and isSeg(segments[3], "inbox") and isSeg(segments[5], "input-required")) {
+            if (method != .POST) return errJson(a, req, .method_not_allowed, "method not allowed");
+            if (!self.requireAgent(agent, req)) return errJson(a, req, .unauthorized, "unauthorized");
+            return self.handleRequestInput(req, agent, segments[4], body);
+        }
+        if (segments.len >= 6 and isSeg(segments[3], "inbox") and isSeg(segments[5], "input")) {
+            if (method != .POST) return errJson(a, req, .method_not_allowed, "method not allowed");
+            // Delivered input may come from the agent (its secret) OR the
+            // producer/admin (admin token) — a human answering an agent's
+            // question is usually not the agent itself.
+            if (!self.requireAgent(agent, req) and !requireAdmin(req)) return errJson(a, req, .unauthorized, "unauthorized");
+            return self.handleProvideInput(req, agent, segments[4], body);
+        }
+
+        // P1: cancel a task (producer/admin or the agent itself).
+        // POST /v1/agents/{id}/inbox/{task}/cancel  (optional body: {"reason": "..."})
+        if (segments.len >= 6 and isSeg(segments[3], "inbox") and isSeg(segments[5], "cancel")) {
+            if (method != .POST) return errJson(a, req, .method_not_allowed, "method not allowed");
+            if (!self.requireAgent(agent, req) and !requireAdmin(req)) return errJson(a, req, .unauthorized, "unauthorized");
+            return self.handleCancel(req, agent, segments[4], body);
         }
 
         if (segments.len == 4 and isSeg(segments[3], "outbox")) {
@@ -142,6 +216,20 @@ pub fn handleWithPath(self: *Server, req: *http.Server.Request, path_with_query:
             if (method != .POST) return errJson(a, req, .method_not_allowed, "method not allowed");
             if (!self.requireAgent(agent, req)) return errJson(a, req, .unauthorized, "unauthorized");
             return self.handleFail(req, agent, segments[4], body);
+        }
+
+        // P1: GetTask — full task state by id (A2A tasks/get analog).
+        // GET /v1/agents/{id}/tasks/{task_id}
+        if (segments.len >= 5 and isSeg(segments[3], "tasks") and method == .GET) {
+            if (!self.requireAgent(agent, req) and !requireAdmin(req)) return errJson(a, req, .unauthorized, "unauthorized");
+            return self.handleGetTask(req, agent, segments[4]);
+        }
+
+        // P0/P1: per-agent card (A2A Agent Card analog) — public metadata for
+        // this agent: name, skills, card_url. No auth: a card is discovery data.
+        // GET /v1/agents/{id}/card
+        if (segments.len == 4 and isSeg(segments[3], "card") and method == .GET) {
+            return self.handleAgentCard(req, agent);
         }
 
         return errJson(a, req, .not_found, "route not found");
@@ -223,21 +311,6 @@ pub fn handleWithPath(self: *Server, req: *http.Server.Request, path_with_query:
     return errJson(a, req, .not_found, "route not found");
 }
 
-fn handleRegisterAgent(self: *Server, req: *http.Server.Request, _: []const u8) !void {
-    var buf: [32]u8 = undefined;
-    self.io.random(&buf);
-    const secret = try fmt.allocPrint(self.allocator, "{s}", .{fmt.bytesToHex(&buf, .lower)});
-    defer self.allocator.free(secret);
-
-    const agent_id = try fmt.allocPrint(self.allocator, "agent-{d}", .{self.agents.count()});
-    errdefer self.allocator.free(agent_id);
-    try self.agents.put(agent_id, try self.allocator.dupe(u8, secret));
-
-    const resp = try fmt.allocPrint(self.allocator, "{{\"agent_id\":\"{s}\",\"agent_secret\":\"{s}\",\"team_id\":\"default\"}}", .{ agent_id, secret });
-    defer self.allocator.free(resp);
-    try json(req, .ok, resp);
-}
-
 fn handleDispatch(self: *Server, req: *http.Server.Request, body: []const u8) !void {
     // Generate a unique task id (t_ + UUID) and a separate workstream id (w_ + UUID).
     const task_id = try uuid.newTaskId(self.io, self.allocator);
@@ -280,8 +353,14 @@ fn handleComplete(self: *Server, req: *http.Server.Request, agent_id: []const u8
     };
     if (!ok) return errJson(self.allocator, req, .not_found, "task not found");
 
+    // P1: fire-and-forget webhook push for terminal transitions.
+    self.notifyWebhooks(agent_id, task_id, "completed");
+
     if (self.agents.get(agent_id)) |secret| {
-        const grant = authn.generateGrantToken(self.allocator, task_id, secret, 3600, 0) catch "{}";
+        // P0 fix: generate with the REAL current time. The old code passed
+        // now_seconds = 0, producing tokens that were expired at unix-3600 —
+        // every grant issued before this fix was dead on arrival.
+        const grant = authn.generateGrantToken(self.allocator, task_id, secret, 3600, self.nowEpochSeconds()) catch "{}";
         defer self.allocator.free(grant);
         const resp = try fmt.allocPrint(self.allocator, "{{\"task_id\":\"{s}\",\"status\":\"completed\",\"grant_token\":\"{s}\"}}", .{ task_id, grant });
         defer self.allocator.free(resp);
@@ -299,9 +378,757 @@ fn handleFail(self: *Server, req: *http.Server.Request, agent_id: []const u8, ta
     };
     if (!ok) return errJson(self.allocator, req, .not_found, "task not found");
 
+    // P1: fire-and-forget webhook push for terminal transitions.
+    self.notifyWebhooks(agent_id, task_id, "failed");
+
     const resp = try fmt.allocPrint(self.allocator, "{{\"task_id\":\"{s}\",\"status\":\"failed\"}}", .{task_id});
     defer self.allocator.free(resp);
     try json(req, .ok, resp);
+}
+
+// ── P0/P1/P2 handlers ─────────────────────────────────────────────────────
+
+/// Current Unix epoch seconds — used for grant-token expiry math. Uses the
+/// Io real-time clock threaded through the server (matches the Io instance
+/// used everywhere else; deterministic under the testing Io).
+fn nowEpochSeconds(self: *Server) i64 {
+    const ts = std.Io.Clock.Timestamp.now(self.io, .real);
+    return ts.raw.toSeconds();
+}
+
+/// P0: lease heartbeat. Extends the claim's visibility timeout so long-running
+/// LLM tasks are not re-queued while still being worked on.
+/// POST /v1/agents/{id}/inbox/{task}/heartbeat[?extend=300]
+fn handleHeartbeat(self: *Server, req: *http.Server.Request, agent_id: []const u8, task_id: []const u8) !void {
+    const a = self.allocator;
+    // Optional ?extend=<seconds> (default 300, same as the claim lease).
+    var extend: i64 = 300;
+    const extend_owned = queryParamDup(a, req.head_buffer, "extend");
+    defer if (extend_owned) |e| a.free(e);
+    if (extend_owned) |e| {
+        if (e.len > 0) {
+            extend = std.fmt.parseInt(i64, e, 10) catch {
+                return errJson(a, req, .bad_request, "invalid extend value");
+            };
+            if (extend < 0 or extend > 86400) {
+                return errJson(a, req, .bad_request, "extend out of range (0..86400)");
+            }
+        }
+    }
+    const locked_until = self.store.heartbeat(a, "default-team", agent_id, task_id, extend) catch |err| {
+        return errJson(a, req, .internal_server_error, @errorName(err));
+    };
+    if (locked_until) |lu| {
+        defer a.free(lu);
+        const resp = try fmt.allocPrint(a, "{{\"task_id\":\"{s}\",\"status\":\"working\",\"locked_until\":\"{s}\"}}", .{ task_id, lu });
+        defer a.free(resp);
+        try json(req, .ok, resp);
+    } else {
+        try json(req, .no_content, "{}");
+    }
+}
+
+/// P1: cancel a task. Producer/admin or the agent itself. If the task is
+/// unclaimed it finalizes immediately; if claimed, it is marked and finalized
+/// on the next claim pass (complete/fail are fenced out by cancel_requested).
+fn handleCancel(self: *Server, req: *http.Server.Request, agent_id: []const u8, task_id: []const u8, body: []const u8) !void {
+    const a = self.allocator;
+    // Optional JSON body {"reason": "..."} — tolerate empty or non-JSON.
+    var reason: []const u8 = "canceled by request";
+    var reason_owned: ?[]const u8 = null;
+    defer if (reason_owned) |r| a.free(r);
+    if (body.len > 0) {
+        if (jsonStringField(a, body, "reason")) |r| {
+            reason_owned = r;
+            reason = r;
+        }
+    }
+    const ok = self.store.cancel("default-team", agent_id, task_id, reason) catch |err| {
+        return errJson(a, req, .internal_server_error, @errorName(err));
+    };
+    if (ok) {
+        // Immediate cancel succeeded — the task is now terminal (we set output).
+        // Emit the terminal webhook + 200 "canceled".
+        self.notifyWebhooks(agent_id, task_id, "canceled");
+        const resp = try fmt.allocPrint(a, "{{\"task_id\":\"{s}\",\"status\":\"canceled\"}}", .{task_id});
+        defer a.free(resp);
+        try json(req, .ok, resp);
+    } else {
+        // `ok=false`: distinguish deferred-mark from unknown/already-terminal.
+        //   - task exists, output NULL → deferred mark → 202 (accepted-pending)
+        //   - task exists, output NOT NULL → already terminal → 404 (cancel failed)
+        //   - task NOT found → 404 (unknown id)
+        const task_opt = self.store.getTask(a, "default-team", agent_id, task_id) catch null;
+        if (task_opt) |t| {
+            const already_terminal = t.output != null;
+            t.deinit(a);
+            if (already_terminal) {
+                return errJson(a, req, .not_found, "task not found or already terminal");
+            }
+        } else {
+            // task not found at all → 404
+            return errJson(a, req, .not_found, "task not found or already terminal");
+        }
+        const resp = try fmt.allocPrint(a, "{{\"task_id\":\"{s}\",\"status\":\"cancel-pending\"}}", .{task_id});
+        defer a.free(resp);
+        try json(req, .accepted, resp);
+    }
+}
+
+/// P1: GetTask — full task state by id (A2A tasks/get analog). Includes
+/// the effective A2A-style state name for interop readability.
+fn handleGetTask(self: *Server, req: *http.Server.Request, agent_id: []const u8, task_id: []const u8) !void {
+    const a = self.allocator;
+    const task = self.store.getTask(a, "default-team", agent_id, task_id) catch |err| {
+        return errJson(a, req, .internal_server_error, @errorName(err));
+    };
+    if (task == null) return errJson(a, req, .not_found, "task not found");
+    const t = task.?;
+    defer t.deinit(a);
+
+    // Derive the A2A-style state name from nullability (the storage model).
+    const state = taskStateOf(t);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.print(a, "{{\"task_id\":\"{s}\",\"agent_id\":\"{s}\",\"action\":\"{s}\",\"state\":\"{s}\",\"try_count\":{d},\"payload\":", .{ t.task_id, t.agent_id, t.action, state, t.try_count });
+    try jsonPayload(&buf, a, t.payload);
+    try buf.appendSlice(a, ",\"output\":");
+    if (t.output) |o| try jsonPayload(&buf, a, o) else try buf.appendSlice(a, "null");
+    try buf.appendSlice(a, ",");
+    try emitOptField(&buf, a, "locked_until", t.locked_until);
+    try buf.appendSlice(a, ",");
+    try emitOptField(&buf, a, "completed_at", t.completed_at);
+    try buf.appendSlice(a, ",");
+    try emitOptField(&buf, a, "workstream_id", t.workstream_id);
+    // P2 fields (now exposed via types.Task).
+    try buf.appendSlice(a, ",");
+    try emitOptField(&buf, a, "available_at", t.available_at);
+    try buf.appendSlice(a, ",");
+    try emitOptField(&buf, a, "blocked_by", t.blocked_by);
+    try buf.appendSlice(a, ",");
+    try emitOptField(&buf, a, "idempotency_key", t.idempotency_key);
+    try buf.appendSlice(a, ",");
+    try emitOptField(&buf, a, "pending_input", t.pending_input);
+    try buf.print(a, ",\"priority\":{d},\"cancel_requested\":{s}", .{ t.priority, if (t.cancel_requested) "true" else "false" });
+    try buf.appendSlice(a, "}");
+    try json(req, .ok, buf.items);
+}
+
+/// Map the storage nullability model onto the A2A TASK_STATE_* vocabulary.
+fn taskStateOf(t: types.Task) []const u8 {
+    if (t.output) |o| {
+        // Robust state detection (was: substring match on output, which
+        // misclassified a completed result containing the word "error"/
+        // "canceled"). Use the structured markers we now write:
+        //   - cancel_requested flag set by cancel() → canceled (terminal).
+        //   - fail() output starting with {"error": → failed (terminal).
+        //   - anything else with output → completed.
+        // A completed result that happens to contain "error" as a substring
+        // is NOT misclassified (startsWith, not indexOf).
+        if (t.cancel_requested) return "canceled";
+        if (std.mem.startsWith(u8, o, "{\"error\":")) return "failed";
+        return "completed";
+    }
+    if (t.pending_input != null) return "input-required";
+    if (t.locked_until != null) return "working";
+    return "submitted";
+}
+
+/// P2: human-in-the-loop. The agent parks the task and asks a question.
+/// POST /v1/agents/{id}/inbox/{task}/input-required  (body: {"query": "..."})
+fn handleRequestInput(self: *Server, req: *http.Server.Request, agent_id: []const u8, task_id: []const u8, body: []const u8) !void {
+    const a = self.allocator;
+    var query: []const u8 = "input required";
+    var query_owned: ?[]const u8 = null;
+    defer if (query_owned) |q| a.free(q);
+    if (jsonStringField(a, body, "query")) |q| {
+        query_owned = q;
+        query = q;
+    }
+    const ok = self.store.requestInput("default-team", agent_id, task_id, query) catch |err| {
+        return errJson(a, req, .internal_server_error, @errorName(err));
+    };
+    if (!ok) return errJson(a, req, .not_found, "task not found or already parked/terminal");
+    const resp = try fmt.allocPrint(a, "{{\"task_id\":\"{s}\",\"status\":\"input-required\"}}", .{task_id});
+    defer a.free(resp);
+    try json(req, .ok, resp);
+}
+
+/// P2: human-in-the-loop. The producer/admin (or agent) answers a parked task.
+/// POST /v1/agents/{id}/inbox/{task}/input  (body: raw input text, or {"input": "..."})
+fn handleProvideInput(self: *Server, req: *http.Server.Request, agent_id: []const u8, task_id: []const u8, body: []const u8) !void {
+    const a = self.allocator;
+    if (body.len == 0) return errJson(a, req, .bad_request, "empty input");
+    // Accept either raw text or a JSON {"input": "..."} wrapper.
+    var input: []const u8 = body;
+    var input_owned: ?[]const u8 = null;
+    defer if (input_owned) |i| a.free(i);
+    if (jsonStringField(a, body, "input")) |i| {
+        input_owned = i;
+        input = i;
+    }
+    const delivered = self.store.provideInput(a, "default-team", agent_id, task_id, input) catch |err| {
+        return errJson(a, req, .internal_server_error, @errorName(err));
+    };
+    if (delivered == null) return errJson(a, req, .not_found, "task not parked awaiting input");
+    a.free(delivered.?); // the echo is not used in the response — free immediately
+    const resp = try fmt.allocPrint(a, "{{\"task_id\":\"{s}\",\"status\":\"working\",\"input_delivered\":true}}", .{task_id});
+    defer a.free(resp);
+    try json(req, .ok, resp);
+}
+
+/// P0: persisted agent registration. Accepts the legacy empty body (server
+/// generates agent-N + secret) or a JSON body carrying metadata:
+/// {"agent_id": "billing", "secret": "...", "name": "Billing Agent",
+///  "skills": ["invoices", "pdf"], "card_url": "https://..."}
+/// On restart the in-memory map is repopulated from the agents table
+/// (loadAgents in main); the map remains the hot auth cache.
+fn handleRegisterAgent(self: *Server, req: *http.Server.Request, body: []const u8) !void {
+    const a = self.allocator;
+    var agent_id: []const u8 = undefined;
+    var secret: []const u8 = undefined;
+    var owned_agent_id: ?[]const u8 = null;
+    var owned_secret: ?[]const u8 = null;
+    var name: ?[]const u8 = null;
+    var skills_json: ?[]const u8 = null;
+    var card_url: ?[]const u8 = null;
+    defer {
+        if (owned_agent_id) |x| a.free(x);
+        if (owned_secret) |x| a.free(x);
+        if (name) |x| a.free(x);
+        if (skills_json) |x| a.free(x);
+        if (card_url) |x| a.free(x);
+    }
+
+    if (body.len > 0) {
+        // JSON registration: agent_id + secret are required when a body is sent.
+        owned_agent_id = jsonStringField(a, body, "agent_id") orelse
+            return errJson(a, req, .bad_request, "missing agent_id");
+        agent_id = owned_agent_id.?;
+        owned_secret = jsonStringField(a, body, "secret") orelse
+            return errJson(a, req, .bad_request, "missing secret");
+        secret = owned_secret.?;
+        if (agent_id.len == 0 or agent_id.len > 256) return errJson(a, req, .bad_request, "agent_id must be 1..256 chars");
+        if (secret.len < 16) return errJson(a, req, .bad_request, "secret must be at least 16 chars");
+        name = jsonStringField(a, body, "name");
+        if (jsonRawField(a, body, "skills")) |s| skills_json = s;
+        card_url = jsonStringField(a, body, "card_url");
+    } else {
+        // Legacy anonymous registration (v0 behavior): server-generated ids.
+        // Use a UUID-based id (agent- + short UUID) to avoid colliding with a
+        // custom `agent_id` like `agent-3` (the old `agent-{count}` scheme collided).
+        var id_buf: [8]u8 = undefined;
+        self.io.random(&id_buf);
+        const id_hex = fmt.bytesToHex(&id_buf, .lower);
+        owned_agent_id = try fmt.allocPrint(a, "agent-{s}", .{id_hex});
+        agent_id = owned_agent_id.?;
+        var buf: [32]u8 = undefined;
+        self.io.random(&buf);
+        owned_secret = try fmt.allocPrint(a, "{s}", .{fmt.bytesToHex(&buf, .lower)});
+        secret = owned_secret.?;
+    }
+
+    // Persist (P0) + keep the in-memory hot cache in sync.
+    self.store.upsertAgent(agent_id, secret, name, skills_json, card_url) catch |err| {
+        return errJson(a, req, .internal_server_error, @errorName(err));
+    };
+    const dup = try a.dupe(u8, secret);
+    const gop = try self.agents.getOrPut(agent_id);
+    if (gop.found_existing) {
+        a.free(dup); // the new key is the same as the existing key; free the redundant dup
+        a.free(gop.value_ptr.*); // free the OLD secret
+        gop.value_ptr.* = try a.dupe(u8, secret); // store a fresh copy
+    } else {
+        gop.key_ptr.* = try a.dupe(u8, agent_id);
+        gop.value_ptr.* = dup; // the map takes ownership of dup on the insert path
+    }
+
+    const resp = try fmt.allocPrint(a, "{{\"agent_id\":\"{s}\",\"agent_secret\":\"{s}\",\"team_id\":\"default\"}}", .{ agent_id, secret });
+    defer a.free(resp);
+    try json(req, .ok, resp);
+}
+
+/// P2: advanced dispatch. JSON body (all optional except agent_id):
+/// {"agent_id": "agent-0", "action": "process", "payload": {…},
+///  "workstream_id": "w_…", "workstream_name": "…",
+///  "priority": 10, "available_at": "2026-01-01 09:00:00",
+///  "blocked_by": ["t_…", "t_…"], "idempotency_key": "key-1"}
+fn handleDispatchAdvanced(self: *Server, req: *http.Server.Request, body: []const u8) !void {
+    const a = self.allocator;
+    if (body.len == 0) return errJson(a, req, .bad_request, "empty body");
+    const agent_id = jsonStringField(a, body, "agent_id") orelse
+        return errJson(a, req, .bad_request, "missing agent_id");
+    defer a.free(agent_id);
+    if (!self.agents.contains(agent_id)) return errJson(a, req, .bad_request, "unknown agent");
+
+    var opts: types.DispatchOptions = .{};
+    var owned: struct {
+        action: ?[]const u8 = null,
+        payload: ?[]const u8 = null,
+        available_at: ?[]const u8 = null,
+        idempotency_key: ?[]const u8 = null,
+        workstream_id: ?[]const u8 = null,
+        workstream_name: ?[]const u8 = null,
+        blocked: ?[]const []const u8 = null,
+        blocked_buf: ?[]const u8 = null,
+    } = .{};
+    defer {
+        if (owned.action) |x| a.free(x);
+        if (owned.payload) |x| a.free(x);
+        if (owned.available_at) |x| a.free(x);
+        if (owned.idempotency_key) |x| a.free(x);
+        if (owned.workstream_id) |x| a.free(x);
+        if (owned.workstream_name) |x| a.free(x);
+        // blocked: the items slice AND each item string are separately
+        // allocated by jsonStringArrayField — free the items first, then the
+        // slice, then the raw backing buffer.
+        if (owned.blocked) |items| {
+            for (items) |item| a.free(item);
+            a.free(items);
+        }
+        if (owned.blocked_buf) |x| a.free(x);
+    }
+
+    owned.action = jsonStringField(a, body, "action");
+    if (jsonRawField(a, body, "payload")) |p| owned.payload = p;
+    if (jsonStringField(a, body, "available_at")) |at| {
+        owned.available_at = at;
+        opts.available_at = at;
+    }
+    if (jsonStringField(a, body, "idempotency_key")) |k| {
+        owned.idempotency_key = k;
+        opts.idempotency_key = k;
+    }
+    if (jsonStringField(a, body, "workstream_id")) |w| {
+        owned.workstream_id = w;
+        // Validate it exists (same rule as the admin form).
+        const found = self.store.lookupWorkstreamById(a, w) catch null;
+        if (found == null) return errJson(a, req, .bad_request, "workstream_id not found");
+        if (found) |f| a.free(f);
+    }
+    if (jsonStringField(a, body, "workstream_name")) |wname| {
+        // Name mode: join if exists, else create.
+        owned.workstream_name = wname;
+        const found = self.store.lookupWorkstreamByName(a, wname) catch null;
+        if (found) |f| {
+            // `f` is caller-owned; keep it (do NOT free before storing).
+            // If both workstream_id and workstream_name were provided, they MUST
+            // refer to the same workstream — otherwise the explicit id is
+            // silently replaced, which is a footgun. Reject the mismatch.
+            if (owned.workstream_id) |id| {
+                if (!std.mem.eql(u8, id, f)) {
+                    a.free(f);
+                    return errJson(a, req, .bad_request, "workstream_id and workstream_name refer to different workstreams");
+                }
+                a.free(f);
+            } else {
+                owned.workstream_id = f;
+            }
+        } else {
+            const new_ws = try uuid.newWorkstreamId(self.io, a);
+            self.store.createWorkstream(new_ws, wname) catch |err| {
+                a.free(new_ws);
+                if (err == error.DuplicateWorkstreamName) return errJson(a, req, .conflict, "workstream name already exists");
+                return errJson(a, req, .internal_server_error, @errorName(err));
+            };
+            owned.workstream_id = new_ws;
+        }
+    }
+    // priority: integer or absent.
+    if (jsonIntField(a, body, "priority")) |p| {
+        if (p < -1000 or p > 1000) return errJson(a, req, .bad_request, "priority out of range (-1000..1000)");
+        opts.priority = @intCast(p);
+    }
+    // blocked_by: array of task ids (JSON array of strings).
+    if (jsonStringArrayField(a, body, "blocked_by")) |arr| {
+        owned.blocked = arr.items;
+        owned.blocked_buf = arr.backing;
+        opts.blocked_by = arr.items;
+    }
+
+    const task_id = try uuid.newTaskId(self.io, a);
+    defer a.free(task_id);
+    const ws_for_dispatch: ?[]const u8 = owned.workstream_id orelse blk: {
+        // Neither workstream_id nor name → fresh anonymous workstream.
+        const new_ws = try uuid.newWorkstreamId(self.io, a);
+        owned.workstream_id = new_ws;
+        break :blk new_ws;
+    };
+
+    const effective_id = self.store.dispatchAdvanced(a, "default-team", agent_id, task_id, owned.action orelse "process", owned.payload orelse "{}", ws_for_dispatch, opts) catch |err| {
+        return errJson(a, req, .internal_server_error, @errorName(err));
+    };
+    defer a.free(effective_id);
+
+    const idempotent = !std.mem.eql(u8, effective_id, task_id);
+    // On an idempotent hit, report the ORIGINAL task's workstream (the fresh
+    // workstream generated above was discarded by the store).
+    const ws_out = blk: {
+        if (idempotent) {
+            const existing = self.store.getTask(a, "default-team", agent_id, effective_id) catch null;
+            if (existing) |t| {
+                defer t.deinit(a);
+                if (t.workstream_id) |w| break :blk try a.dupe(u8, w);
+            }
+        }
+        break :blk try a.dupe(u8, owned.workstream_id orelse "");
+    };
+    defer a.free(ws_out);
+    const resp = try fmt.allocPrint(a, "{{\"task_id\":\"{s}\",\"workstream_id\":\"{s}\",\"status\":\"dispatched\",\"idempotent\":{s}\"}}", .{ effective_id, ws_out, if (idempotent) "true" else "false" });
+    defer a.free(resp);
+    try json(req, .ok, resp);
+}
+
+/// P1: per-agent card — A2A Agent Card analog for one agent.
+fn handleAgentCard(self: *Server, req: *http.Server.Request, agent_id: []const u8) !void {
+    const a = self.allocator;
+    // Read from the persisted registry (skills/name/card_url live there).
+    const agents = self.store.listAgents(a) catch |err| {
+        return errJson(a, req, .internal_server_error, @errorName(err));
+    };
+    defer {
+        for (agents) |ag| ag.deinit(a);
+        a.free(agents);
+    }
+    for (agents) |ag| {
+        if (std.mem.eql(u8, ag.agent_id, agent_id)) {
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(a);
+            try buf.print(a, "{{\"agent_id\":\"{s}\",\"name\":", .{agent_id});
+            if (ag.name) |n| try jsonPayload(&buf, a, n) else try buf.appendSlice(a, "null");
+            try buf.appendSlice(a, ",\"skills\":");
+            if (ag.skills) |s| try buf.appendSlice(a, s) else try buf.appendSlice(a, "[]");
+            try buf.appendSlice(a, ",\"card_url\":");
+            if (ag.card_url) |c| try jsonPayload(&buf, a, c) else try buf.appendSlice(a, "null");
+            try buf.print(a, ",\"created_at\":\"{s}\"}}", .{ag.created_at});
+            try json(req, .ok, buf.items);
+            return;
+        }
+    }
+    return errJson(a, req, .not_found, "agent not found");
+}
+
+/// P1: the box's own well-known card — describes the service and lists agents.
+fn handleWellKnownCard(self: *Server, req: *http.Server.Request) !void {
+    const a = self.allocator;
+    const agents = self.store.listAgents(a) catch |err| {
+        return errJson(a, req, .internal_server_error, @errorName(err));
+    };
+    defer {
+        for (agents) |ag| ag.deinit(a);
+        a.free(agents);
+    }
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.appendSlice(a, "{\"name\":\"franky-box\",\"description\":\"SQLite-backed task inbox/outbox queue for LLM agents\",\"version\":\"");
+    try buf.appendSlice(a, build_options.version);
+    try buf.appendSlice(a, "\",\"agents\":[");
+    for (agents, 0..) |ag, i| {
+        if (i > 0) try buf.appendSlice(a, ",");
+        try jsonPayload(&buf, a, ag.agent_id);
+    }
+    try buf.appendSlice(a, "]}");
+    try json(req, .ok, buf.items);
+}
+
+// ── Webhook subscription handlers (P1) ────────────────────────────────────
+
+fn handleAddWebhook(self: *Server, req: *http.Server.Request, body: []const u8) !void {
+    const a = self.allocator;
+    const url = jsonStringField(a, body, "url") orelse
+        return errJson(a, req, .bad_request, "missing url");
+    defer a.free(url);
+    if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) {
+        return errJson(a, req, .bad_request, "url must be http(s)");
+    }
+    const task_id = jsonStringField(a, body, "task_id");
+    defer if (task_id) |t| a.free(t);
+    const agent_id = jsonStringField(a, body, "agent_id");
+    defer if (agent_id) |g| a.free(g);
+    if (task_id == null and agent_id == null) {
+        return errJson(a, req, .bad_request, "task_id or agent_id required");
+    }
+    // Optional secret: caller-supplied signing secret. When absent, generate.
+    var secret = jsonStringField(a, body, "secret");
+    defer if (secret) |s| a.free(s);
+    if (secret == null) {
+        var buf: [32]u8 = undefined;
+        self.io.random(&buf);
+        secret = try fmt.allocPrint(a, "{s}", .{fmt.bytesToHex(&buf, .lower)});
+    }
+    const sub_id = try uuid.newPrefixed(self.io, a, "wh_");
+    defer a.free(sub_id);
+    self.store.addWebhook(sub_id, url, secret.?, task_id, agent_id) catch |err| {
+        return errJson(a, req, .internal_server_error, @errorName(err));
+    };
+    const resp = try fmt.allocPrint(a, "{{\"subscription_id\":\"{s}\",\"secret\":\"{s}\"}}", .{ sub_id, secret.? });
+    defer a.free(resp);
+    try json(req, .ok, resp);
+}
+
+fn handleListWebhooks(self: *Server, req: *http.Server.Request) !void {
+    const a = self.allocator;
+    const task_id = queryParamDup(a, req.head_buffer, "task_id");
+    defer if (task_id) |t| a.free(t);
+    const agent_id = queryParamDup(a, req.head_buffer, "agent_id");
+    defer if (agent_id) |g| a.free(g);
+    const subs = self.store.listWebhooks(a, task_id, agent_id) catch |err| {
+        return errJson(a, req, .internal_server_error, @errorName(err));
+    };
+    defer {
+        for (subs) |s| s.deinit(a);
+        a.free(subs);
+    }
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.appendSlice(a, "[");
+    for (subs, 0..) |s, i| {
+        if (i > 0) try buf.appendSlice(a, ",");
+        try buf.print(a, "{{\"subscription_id\":\"{s}\",\"url\":\"{s}\",\"task_id\":", .{ s.subscription_id, s.url });
+        if (s.task_id) |t| try jsonPayload(&buf, a, t) else try buf.appendSlice(a, "null");
+        try buf.appendSlice(a, ",\"agent_id\":");
+        if (s.agent_id) |g| try jsonPayload(&buf, a, g) else try buf.appendSlice(a, "null");
+        try buf.print(a, ",\"created_at\":\"{s}\"}}", .{s.created_at});
+    }
+    try buf.appendSlice(a, "]");
+    try json(req, .ok, buf.items);
+}
+
+fn handleDeleteWebhook(self: *Server, req: *http.Server.Request, sub_id: []const u8) !void {
+    const a = self.allocator;
+    const ok = self.store.deleteWebhook(sub_id) catch |err| {
+        return errJson(a, req, .internal_server_error, @errorName(err));
+    };
+    if (!ok) return errJson(a, req, .not_found, "subscription not found");
+    const resp = try fmt.allocPrint(a, "{{\"subscription_id\":\"{s}\",\"deleted\":true}}", .{sub_id});
+    defer a.free(resp);
+    try json(req, .ok, resp);
+}
+
+/// P0: grant-token verification closes the /v1/results stub. The task's
+/// agent secret is the HMAC key; only a valid, unexpired token for THIS
+/// task returns the result.
+fn handleGetResult(self: *Server, req: *http.Server.Request, task_id: []const u8) !void {
+    const a = self.allocator;
+    const token = queryParamDup(a, req.head_buffer, "token") orelse
+        return errJson(a, req, .bad_request, "missing token");
+    defer a.free(token);
+    if (token.len == 0) return errJson(a, req, .bad_request, "missing token");
+
+    // Find which agent owns the task (the token is bound to the agent secret).
+    // Scan registered agents — /v1/results is a cross-agent endpoint.
+    const agents = self.store.listAgents(a) catch |err| {
+        return errJson(a, req, .internal_server_error, @errorName(err));
+    };
+    defer {
+        for (agents) |ag| ag.deinit(a);
+        a.free(agents);
+    }
+
+    for (agents) |ag| {
+        // Quick reject: token must verify against THIS agent's secret + task.
+        const valid = authn.verifyGrantTokenFor(a, token, task_id, ag.secret, self.nowEpochSeconds()) catch false;
+        if (!valid) continue;
+        // Verified — return the task's output.
+        const task = self.store.getTask(a, "default-team", ag.agent_id, task_id) catch |err| {
+            return errJson(a, req, .internal_server_error, @errorName(err));
+        };
+        if (task == null) continue; // token valid but task in another tenant — keep scanning
+        const t = task.?;
+        defer t.deinit(a);
+        if (t.output == null) {
+            return errJson(a, req, .not_found, "task not completed yet");
+        }
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(a);
+        try buf.print(a, "{{\"task_id\":\"{s}\",\"output\":", .{task_id});
+        try jsonPayload(&buf, a, t.output.?);
+        try buf.appendSlice(a, "}");
+        try json(req, .ok, buf.items);
+        return;
+    }
+    return errJson(a, req, .unauthorized, "invalid or expired token");
+}
+
+/// JSON helpers for the handlers above — lightweight extraction without a
+/// full parse (std.json.Value over an arena would be fine too; these keep
+/// allocations explicit and minimal).
+
+/// Extract a top-level string field from a JSON object body. Caller owns the
+/// returned slice. Returns null when the field is absent (or not a string).
+fn jsonStringField(a: std.mem.Allocator, body: []const u8, key: []const u8) ?[]const u8 {
+    // Find "key": then a string value. Minimal JSON: whitespace tolerant.
+    // Track string context so a key name appearing inside a string value
+    // (e.g. {"payload":"\"agent_id\":\"x\"","agent_id":"y"}) is NOT matched.
+    var i: usize = 0;
+    while (i < body.len) : (i += 1) {
+        const c = body[i];
+        if (c == '\\' and i + 1 < body.len) {
+            // Escaped char inside a string — skip the next byte.
+            i += 1;
+            continue;
+        }
+        if (c != '"') continue;
+        // Candidate key start; match the key exactly.
+        if (i + key.len + 1 > body.len) return null;
+        if (!std.mem.eql(u8, body[i + 1 .. i + 1 + key.len], key)) continue;
+        if (body[i + 1 + key.len] != '"') continue;
+        // Key matched — find the colon after it.
+        var j = i + key.len + 2;
+        while (j < body.len and body[j] != ':') : (j += 1) {}
+        if (j >= body.len) return null;
+        j += 1;
+        while (j < body.len and (body[j] == ' ' or body[j] == '\t' or body[j] == '\n' or body[j] == '\r')) : (j += 1) {}
+        if (j >= body.len or body[j] != '"') return null; // not a string value
+        // Parse the string with escapes into owned memory.
+        j += 1;
+        var out: std.ArrayList(u8) = .empty;
+        while (j < body.len) {
+            const ch = body[j];
+            if (ch == '"') return out.toOwnedSlice(a) catch null;
+            if (ch == '\\' and j + 1 < body.len) {
+                j += 1;
+                switch (body[j]) {
+                    'n' => out.append(a, '\n') catch return null,
+                    't' => out.append(a, '\t') catch return null,
+                    'r' => out.append(a, '\r') catch return null,
+                    'b' => out.append(a, 8) catch return null,
+                    'f' => out.append(a, 12) catch return null,
+                    'u' => {
+                        if (j + 4 >= body.len) return null;
+                        const cp = std.fmt.parseInt(u21, body[j + 1 .. j + 5], 16) catch return null;
+                        var utf8_buf: [4]u8 = undefined;
+                        const n = std.unicode.utf8Encode(cp, &utf8_buf) catch return null;
+                        out.appendSlice(a, utf8_buf[0..n]) catch return null;
+                        j += 4;
+                    },
+                    else => out.append(a, body[j]) catch return null,
+                }
+            } else {
+                out.append(a, ch) catch return null;
+            }
+            j += 1;
+        }
+        return null;
+    }
+    return null;
+}
+
+/// Extract a top-level field's RAW JSON value (trimmed) — for values that are
+/// objects/arrays (payload, skills) that must be stored verbatim.
+fn jsonRawField(a: std.mem.Allocator, body: []const u8, key: []const u8) ?[]const u8 {
+    // Track string context so a key name appearing inside a string value
+    // is NOT matched as a top-level field.
+    var i: usize =0;
+    while (i < body.len) : (i += 1) {
+        const c = body[i];
+        if (c == '\\' and i + 1 < body.len) {
+            i += 1;
+            continue;
+        }
+        if (c != '"') continue;
+        if (i + key.len + 1 > body.len) return null;
+        if (!std.mem.eql(u8, body[i + 1 .. i + 1 + key.len], key)) continue;
+        if (body[i + 1 + key.len] != '"') continue;
+        var j = i + key.len + 2;
+        j += 1;
+        while (j < body.len and (body[j] == ' ' or body[j] == '\t' or body[j] == '\n' or body[j] == '\r')) : (j += 1) {}
+        if (j >= body.len) return null;
+        // Find the end of the raw value: for objects/arrays, match braces;
+        // for scalars, up to comma/}/end.
+        const start = j;
+        if (body[j] == '{' or body[j] == '[') {
+            const open = body[j];
+            const close: u8 = if (open == '{') '}' else ']';
+            var depth: usize = 0;
+            var in_str = false;
+            while (j < body.len) : (j += 1) {
+                const ch = body[j];
+                if (in_str) {
+                    if (ch == '\\') j += 1 else if (ch == '"') in_str = false;
+                    continue;
+                }
+                if (ch == '"') in_str = true;
+                if (ch == open) depth += 1;
+                if (ch == close) {
+                    depth -= 1;
+                    if (depth == 0) {
+                        return a.dupe(u8, body[start .. j + 1]) catch null;
+                    }
+                }
+            }
+            return null;
+        }
+        // Scalar: up to a comma or closing brace at depth 0 (no strings here).
+        while (j < body.len and body[j] != ',' and body[j] != '}') : (j += 1) {}
+        return a.dupe(u8, body[start..j]) catch null;
+    }
+    return null;
+}
+
+/// Extract a top-level integer field. Returns null when absent/non-integer.
+fn jsonIntField(a: std.mem.Allocator, body: []const u8, key: []const u8) ?i64 {
+    const raw = jsonRawField(a, body, key) orelse return null;
+    defer a.free(raw);
+    return std.fmt.parseInt(i64, std.mem.trim(u8, raw, " \t\n\r"), 10) catch null;
+}
+
+/// A parsed string-array field (for blocked_by): items point into `backing`.
+const JsonStringArray = struct {
+    items: []const []const u8,
+    backing: []const u8,
+};
+
+/// Extract a top-level array-of-strings field. Caller frees `backing` and
+/// `items` (items slice first, then backing). Returns null when absent/malformed.
+fn jsonStringArrayField(a: std.mem.Allocator, body: []const u8, key: []const u8) ?JsonStringArray {
+    const raw = jsonRawField(a, body, key) orelse return null;
+    errdefer a.free(raw);
+    if (raw.len < 2 or raw[0] != '[') {
+        a.free(raw);
+        return null;
+    }
+    var items: std.ArrayList([]const u8) = .empty;
+    // On any failure after items were allocated, free them all before
+    // returning null (errdefer alone doesn't cover per-item slices).
+    errdefer {
+        for (items.items) |it| a.free(it);
+        items.deinit(a);
+    }
+    var i: usize = 1;
+    while (i < raw.len) {
+        while (i < raw.len and (raw[i] == ' ' or raw[i] == ',')) : (i += 1) {}
+        if (i >= raw.len or raw[i] == ']') break;
+        if (raw[i] != '"') return null;
+        i += 1;
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(a);
+        while (i < raw.len and raw[i] != '"') {
+            if (raw[i] == '\\' and i + 1 < raw.len) {
+                i += 1;
+                out.append(a, raw[i]) catch return null;
+            } else {
+                out.append(a, raw[i]) catch return null;
+            }
+            i += 1;
+        }
+        if (i >= raw.len) return null; // unterminated string
+        i += 1;
+        const owned = out.toOwnedSlice(a) catch return null;
+        items.append(a, owned) catch {
+            a.free(owned);
+            return null;
+        };
+    }
+    const items_slice = items.toOwnedSlice(a) catch return null; // items moved into the slice
+    errdefer a.free(items_slice);
+    return .{ .items = items_slice, .backing = raw };
+}
+
+/// Deliver webhooks for a terminal task transition (fire-and-forget).
+fn notifyWebhooks(self: *Server, agent_id: []const u8, task_id: []const u8, event: []const u8) void {
+    webhook.notify(self.allocator, self.io, self.store, agent_id, task_id, event, self.webhook_timeout_ms);
 }
 
 fn handleReadOutbox(self: *Server, req: *http.Server.Request, agent_id: []const u8) !void {
@@ -363,14 +1190,6 @@ fn handleAckAll(self: *Server, req: *http.Server.Request, agent_id: []const u8) 
     const resp = try fmt.allocPrint(a, "{{\"status\":\"consumed\",\"acked\":{d},\"archived\":{d}}}", .{ result.acked, result.archived });
     defer a.free(resp);
     try json(req, .ok, resp);
-}
-
-fn handleGetResult(self: *Server, req: *http.Server.Request, _: []const u8) !void {
-    const target = req.head.target;
-    const qpos = mem.indexOfScalar(u8, target, '?') orelse return errJson(self.allocator, req, .bad_request, "missing token");
-    const qs = target[qpos + 1 ..];
-    if (mem.indexOf(u8, qs, "token=") == null) return errJson(self.allocator, req, .bad_request, "missing token parameter");
-    try json(req, .ok, "{\"status\":\"result_available\"}");
 }
 
 fn isSeg(seg: []const u8, lit: []const u8) bool { return mem.eql(u8, seg, lit); }
@@ -602,17 +1421,35 @@ fn handleAdminAgentsFragment(self: *Server, req: *http.Server.Request) !void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
     try buf.appendSlice(a, "<h2 id=\"agents\">🤖 Registered Agents</h2>");
-    if (self.agents.count() == 0) {
+    // P0: list from the persisted registry (the source of truth), so the
+    // fragment shows name/skills/created_at and survives restarts.
+    const agents = self.store.listAgents(a) catch |err| {
+        return htmlError(a, req, .internal_server_error, @errorName(err));
+    };
+    defer {
+        for (agents) |ag| ag.deinit(a);
+        a.free(agents);
+    }
+    if (agents.len == 0) {
         try buf.appendSlice(a, "<p>No agents registered.</p>");
     } else {
-        try buf.appendSlice(a, "<table class=\"resp-table\" id=\"agents-table\"><thead><tr><th>Agent ID</th><th>Secret</th></tr></thead><tbody>");
-        var it = self.agents.iterator();
-        while (it.next()) |entry| {
+        try buf.appendSlice(a, "<table class=\"resp-table\" id=\"agents-table\"><thead><tr><th>Agent ID</th><th>Name</th><th>Skills</th><th>Secret</th><th>Created</th></tr></thead><tbody>");
+        for (agents) |ag| {
             try buf.appendSlice(a, "<tr><td data-label=\"Agent ID\">");
-            try htmlEscape(&buf, a, entry.key_ptr.*);
+            try htmlEscape(&buf, a, ag.agent_id);
+            try buf.appendSlice(a, "</td><td data-label=\"Name\">");
+            if (ag.name) |n| try htmlEscape(&buf, a, n) else try buf.appendSlice(a, "—");
+            try buf.appendSlice(a, "</td><td data-label=\"Skills\">");
+            if (ag.skills) |s| {
+                try buf.appendSlice(a, "<code>");
+                try htmlEscape(&buf, a, s);
+                try buf.appendSlice(a, "</code>");
+            } else try buf.appendSlice(a, "—");
             try buf.appendSlice(a, "</td><td data-label=\"Secret\"><code>");
-            try htmlEscape(&buf, a, entry.value_ptr.*);
-            try buf.appendSlice(a, "</code></td></tr>");
+            try htmlEscape(&buf, a, ag.secret);
+            try buf.appendSlice(a, "</code></td><td data-label=\"Created\">");
+            try htmlEscape(&buf, a, ag.created_at);
+            try buf.appendSlice(a, "</td></tr>");
         }
         try buf.appendSlice(a, "</tbody></table>");
     }
@@ -925,5 +1762,49 @@ fn jsonPayload(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, raw: []con
 }
 
 pub fn registerDefaultAgent(self: *Server) !void {
-    try self.agents.put(try self.allocator.dupe(u8, "agent-0"), try self.allocator.dupe(u8, "default-secret-please-change"));
+    // P0: persist the default agent too, so a fresh DB and an old DB behave
+    // the same way (the in-memory map is rebuilt from the store on startup).
+    self.store.upsertAgent("agent-0", "default-secret-please-change", "Default Agent", null, null) catch |err| {
+        std.log.warn("registerDefaultAgent: persist failed: {s}", .{@errorName(err)});
+    };
+    const gop = try self.agents.getOrPut("agent-0");
+    if (gop.found_existing) {
+        // Key exists — free the old secret and store a fresh copy. The key
+        // string itself is a literal and not owned by the map, so no key free.
+        self.allocator.free(gop.value_ptr.*);
+        gop.value_ptr.* = try self.allocator.dupe(u8, "default-secret-please-change");
+    } else {
+        // Insert path: the map owns both the key and the value from now on.
+        gop.key_ptr.* = try self.allocator.dupe(u8, "agent-0");
+        gop.value_ptr.* = try self.allocator.dupe(u8, "default-secret-please-change");
+    }
+}
+
+/// P0: repopulate the in-memory auth cache from the persisted agents table.
+/// Called once at startup after the store is ready, before serving. Idempotent:
+/// existing map entries are replaced (the store is the source of truth).
+pub fn loadAgents(self: *Server) !void {
+    const records = self.store.listAgents(self.allocator) catch |err| {
+        std.log.warn("loadAgents: {s}", .{@errorName(err)});
+        return;
+    };
+    defer {
+        for (records) |r| r.deinit(self.allocator);
+        self.allocator.free(records);
+    }
+    for (records) |r| {
+        const gop = try self.agents.getOrPut(r.agent_id);
+        if (gop.found_existing) {
+            // Key collision (shouldn't happen for persisted ids, but be correct):
+            // free the old secret, store a fresh copy. The key is already owned
+            // by the map, so the `r.agent_id` slice (owned by the record) is the
+            // canonical key — no key dup/free needed here.
+            self.allocator.free(gop.value_ptr.*);
+            gop.value_ptr.* = try self.allocator.dupe(u8, r.secret);
+        } else {
+            // Insert path: the map takes ownership of both the key and value.
+            gop.key_ptr.* = try self.allocator.dupe(u8, r.agent_id);
+            gop.value_ptr.* = try self.allocator.dupe(u8, r.secret);
+        }
+    }
 }
