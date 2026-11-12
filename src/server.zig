@@ -454,12 +454,19 @@ fn handleCancel(self: *Server, req: *http.Server.Request, agent_id: []const u8, 
         defer a.free(resp);
         try json(req, .ok, resp);
     } else {
-        // `ok=false`: either deferred-mark (task exists, output NULL → 202)
-        // or already-terminal/unknown (cancel failed → 404). Distinguish by task state.
+        // `ok=false`: distinguish deferred-mark from unknown/already-terminal.
+        //   - task exists, output NULL → deferred mark → 202 (accepted-pending)
+        //   - task exists, output NOT NULL → already terminal → 404 (cancel failed)
+        //   - task NOT found → 404 (unknown id)
         const task_opt = self.store.getTask(a, "default-team", agent_id, task_id) catch null;
-        const already_terminal = if (task_opt) |t| (t.output != null) else false;
-        if (task_opt) |t| t.deinit(a);
-        if (already_terminal) {
+        if (task_opt) |t| {
+            const already_terminal = t.output != null;
+            t.deinit(a);
+            if (already_terminal) {
+                return errJson(a, req, .not_found, "task not found or already terminal");
+            }
+        } else {
+            // task not found at all → 404
             return errJson(a, req, .not_found, "task not found or already terminal");
         }
         const resp = try fmt.allocPrint(a, "{{\"task_id\":\"{s}\",\"status\":\"cancel-pending\"}}", .{task_id});
@@ -609,12 +616,17 @@ fn handleRegisterAgent(self: *Server, req: *http.Server.Request, body: []const u
         card_url = jsonStringField(a, body, "card_url");
     } else {
         // Legacy anonymous registration (v0 behavior): server-generated ids.
+        // Use a UUID-based id (agent- + short UUID) to avoid colliding with a
+        // custom `agent_id` like `agent-3` (the old `agent-{count}` scheme collided).
+        var id_buf: [8]u8 = undefined;
+        self.io.random(&id_buf);
+        const id_hex = fmt.bytesToHex(&id_buf, .lower);
+        owned_agent_id = try fmt.allocPrint(a, "agent-{s}", .{id_hex});
+        agent_id = owned_agent_id.?;
         var buf: [32]u8 = undefined;
         self.io.random(&buf);
         owned_secret = try fmt.allocPrint(a, "{s}", .{fmt.bytesToHex(&buf, .lower)});
         secret = owned_secret.?;
-        owned_agent_id = try fmt.allocPrint(a, "agent-{d}", .{self.agents.count()});
-        agent_id = owned_agent_id.?;
     }
 
     // Persist (P0) + keep the in-memory hot cache in sync.
@@ -701,7 +713,18 @@ fn handleDispatchAdvanced(self: *Server, req: *http.Server.Request, body: []cons
         const found = self.store.lookupWorkstreamByName(a, wname) catch null;
         if (found) |f| {
             // `f` is caller-owned; keep it (do NOT free before storing).
-            owned.workstream_id = f;
+            // If both workstream_id and workstream_name were provided, they MUST
+            // refer to the same workstream — otherwise the explicit id is
+            // silently replaced, which is a footgun. Reject the mismatch.
+            if (owned.workstream_id) |id| {
+                if (!std.mem.eql(u8, id, f)) {
+                    a.free(f);
+                    return errJson(a, req, .bad_request, "workstream_id and workstream_name refer to different workstreams");
+                }
+                a.free(f);
+            } else {
+                owned.workstream_id = f;
+            }
         } else {
             const new_ws = try uuid.newWorkstreamId(self.io, a);
             self.store.createWorkstream(new_ws, wname) catch |err| {
@@ -936,9 +959,17 @@ fn handleGetResult(self: *Server, req: *http.Server.Request, task_id: []const u8
 /// returned slice. Returns null when the field is absent (or not a string).
 fn jsonStringField(a: std.mem.Allocator, body: []const u8, key: []const u8) ?[]const u8 {
     // Find "key": then a string value. Minimal JSON: whitespace tolerant.
+    // Track string context so a key name appearing inside a string value
+    // (e.g. {"payload":"\"agent_id\":\"x\"","agent_id":"y"}) is NOT matched.
     var i: usize = 0;
     while (i < body.len) : (i += 1) {
-        if (body[i] != '"') continue;
+        const c = body[i];
+        if (c == '\\' and i + 1 < body.len) {
+            // Escaped char inside a string — skip the next byte.
+            i += 1;
+            continue;
+        }
+        if (c != '"') continue;
         // Candidate key start; match the key exactly.
         if (i + key.len + 1 > body.len) return null;
         if (!std.mem.eql(u8, body[i + 1 .. i + 1 + key.len], key)) continue;
@@ -954,9 +985,9 @@ fn jsonStringField(a: std.mem.Allocator, body: []const u8, key: []const u8) ?[]c
         j += 1;
         var out: std.ArrayList(u8) = .empty;
         while (j < body.len) {
-            const c = body[j];
-            if (c == '"') return out.toOwnedSlice(a) catch null;
-            if (c == '\\' and j + 1 < body.len) {
+            const ch = body[j];
+            if (ch == '"') return out.toOwnedSlice(a) catch null;
+            if (ch == '\\' and j + 1 < body.len) {
                 j += 1;
                 switch (body[j]) {
                     'n' => out.append(a, '\n') catch return null,
@@ -975,7 +1006,7 @@ fn jsonStringField(a: std.mem.Allocator, body: []const u8, key: []const u8) ?[]c
                     else => out.append(a, body[j]) catch return null,
                 }
             } else {
-                out.append(a, c) catch return null;
+                out.append(a, ch) catch return null;
             }
             j += 1;
         }
@@ -987,15 +1018,20 @@ fn jsonStringField(a: std.mem.Allocator, body: []const u8, key: []const u8) ?[]c
 /// Extract a top-level field's RAW JSON value (trimmed) — for values that are
 /// objects/arrays (payload, skills) that must be stored verbatim.
 fn jsonRawField(a: std.mem.Allocator, body: []const u8, key: []const u8) ?[]const u8 {
-    var i: usize = 0;
+    // Track string context so a key name appearing inside a string value
+    // is NOT matched as a top-level field.
+    var i: usize =0;
     while (i < body.len) : (i += 1) {
-        if (body[i] != '"') continue;
+        const c = body[i];
+        if (c == '\\' and i + 1 < body.len) {
+            i += 1;
+            continue;
+        }
+        if (c != '"') continue;
         if (i + key.len + 1 > body.len) return null;
         if (!std.mem.eql(u8, body[i + 1 .. i + 1 + key.len], key)) continue;
         if (body[i + 1 + key.len] != '"') continue;
         var j = i + key.len + 2;
-        while (j < body.len and body[j] != ':') : (j += 1) {}
-        if (j >= body.len) return null;
         j += 1;
         while (j < body.len and (body[j] == ' ' or body[j] == '\t' or body[j] == '\n' or body[j] == '\r')) : (j += 1) {}
         if (j >= body.len) return null;
@@ -1008,14 +1044,14 @@ fn jsonRawField(a: std.mem.Allocator, body: []const u8, key: []const u8) ?[]cons
             var depth: usize = 0;
             var in_str = false;
             while (j < body.len) : (j += 1) {
-                const c = body[j];
+                const ch = body[j];
                 if (in_str) {
-                    if (c == '\\') j += 1 else if (c == '"') in_str = false;
+                    if (ch == '\\') j += 1 else if (ch == '"') in_str = false;
                     continue;
                 }
-                if (c == '"') in_str = true;
-                if (c == open) depth += 1;
-                if (c == close) {
+                if (ch == '"') in_str = true;
+                if (ch == open) depth += 1;
+                if (ch == close) {
                     depth -= 1;
                     if (depth == 0) {
                         return a.dupe(u8, body[start .. j + 1]) catch null;

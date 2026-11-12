@@ -124,7 +124,16 @@ fn deliverOne(
             .{ .name = "x-franky-box-signature", .value = sig_header },
         },
     }) catch |err| {
-        _ = webhook_timeout_ms; // connect timeout is set below via client.connect options
+        // Best-effort: the std.http.Client.fetch API does not expose a
+        // connect/read timeout, so a slow or dead webhook endpoint can
+        // block this delivery until the OS TCP timeout fires. This is
+        // an accepted P1 trade-off: webhook delivery is fire-and-forget
+        // in spirit (errors are logged, never block the triggering
+        // request's *outcome*), and consumers always have the outbox poll
+        // as the source of truth. Moving delivery to a background
+        // thread with a bounded timeout is a P3 item. `webhook_timeout_ms`
+        // is kept on the Server for when that becomes possible.
+        _ = webhook_timeout_ms;
         return err;
     };
     // Status >= 400 is logged by the caller as a failure? fetch gives us the

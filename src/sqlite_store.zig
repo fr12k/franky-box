@@ -568,7 +568,7 @@ pub const SqliteStore = struct {
             \\UPDATE tasks
             \\SET pending_input = NULL,
             \\    locked_until = strftime('%Y-%m-%d %H:%M:%f', 'now', '+300 seconds'),
-            \\    payload = payload || '\n---human-input---\n' || ?
+            \\    payload = payload || char(10) || '---human-input---' || char(10) || ?
             \\WHERE tenant_id = ? AND agent_id = ? AND task_id = ?
             \\  AND output IS NULL AND pending_input IS NOT NULL
         ;

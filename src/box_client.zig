@@ -162,7 +162,7 @@ pub fn register(self: *BoxClient) ![]const u8 {
     };
 
     if (result.status != .ok) return error.RequestFailed;
-    return body_writer.writer.buffered();
+    return self.allocator.dupe(u8, body_writer.writer.buffered()) catch return error.RequestFailed;
 }
 
 /// Dispatch a task (admin endpoint).
@@ -192,7 +192,7 @@ pub fn dispatch(self: *BoxClient, action: []const u8, payload: []const u8) ![]co
     };
 
     if (result.status != .ok) return error.RequestFailed;
-    return body_writer.writer.buffered();
+    return self.allocator.dupe(u8, body_writer.writer.buffered()) catch return error.RequestFailed;
 }
 
 /// Claim the next available task. Returns `null` when no tasks are available (HTTP 204).
@@ -335,7 +335,7 @@ pub fn readOutbox(self: *BoxClient, since: ?[]const u8) ![]const u8 {
     };
 
     if (result.status != .ok) return error.RequestFailed;
-    return body_writer.writer.buffered();
+    return self.allocator.dupe(u8, body_writer.writer.buffered()) catch return error.RequestFailed;
 }
 
 /// Get a result by task ID (requires a grant token from the complete response).
@@ -357,7 +357,7 @@ pub fn getResult(self: *BoxClient, task_id: []const u8, token: []const u8) ![]co
     };
 
     if (result.status != .ok) return error.RequestFailed;
-    return body_writer.writer.buffered();
+    return self.allocator.dupe(u8, body_writer.writer.buffered()) catch return error.RequestFailed;
 }
 
 // ── P0-P2 additions ───────────────────────────────────────────────────
@@ -382,7 +382,7 @@ pub fn heartbeat(self: *BoxClient, task_id: []const u8, extend_seconds: ?i64) ![
         return error.RequestFailed;
     };
     if (result.status != .ok and result.status != .no_content) return error.RequestFailed;
-    return body_writer.writer.buffered();
+    return self.allocator.dupe(u8, body_writer.writer.buffered()) catch return error.RequestFailed;
 }
 
 /// Cancel a task (agent or producer/admin auth). Returns the response JSON.
@@ -409,7 +409,7 @@ pub fn cancel(self: *BoxClient, task_id: []const u8, reason: []const u8) ![]cons
     };
     // Deferred cancel now returns 202 Accepted; accept both 200 and 202.
     if (result.status != .ok and result.status != .accepted) return error.RequestFailed;
-    return body_writer.writer.buffered();
+    return self.allocator.dupe(u8, body_writer.writer.buffered()) catch return error.RequestFailed;
 }
 
 /// Get a task's full state (A2A-style state names in the response).
@@ -427,7 +427,7 @@ pub fn getTask(self: *BoxClient, task_id: []const u8) ![]const u8 {
         return error.RequestFailed;
     };
     if (result.status != .ok) return error.RequestFailed;
-    return body_writer.writer.buffered();
+    return self.allocator.dupe(u8, body_writer.writer.buffered()) catch return error.RequestFailed;
 }
 
 /// Park the current task and ask for human/producer input.
@@ -453,7 +453,7 @@ pub fn requestInput(self: *BoxClient, task_id: []const u8, query: []const u8) ![
         return error.RequestFailed;
     };
     if (result.status != .ok) return error.RequestFailed;
-    return body_writer.writer.buffered();
+    return self.allocator.dupe(u8, body_writer.writer.buffered()) catch return error.RequestFailed;
 }
 
 /// Fetch the box's well-known Agent Card (public, no auth needed).
@@ -470,5 +470,5 @@ pub fn wellKnownCard(self: *BoxClient) ![]const u8 {
         return error.RequestFailed;
     };
     if (result.status != .ok) return error.RequestFailed;
-    return body_writer.writer.buffered();
+    return self.allocator.dupe(u8, body_writer.writer.buffered()) catch return error.RequestFailed;
 }
